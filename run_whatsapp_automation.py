@@ -1,98 +1,48 @@
 #!/usr/bin/env python3
 """
-WhatsApp Lead Automation - Production Runner
-============================================
-
-This script runs the WhatsApp lead automation with real leads from the API.
-Make sure to:
-1. Update your .env file with correct API tokens
-2. Ensure WhatsApp Web is accessible
-3. Be ready to scan QR code if needed
-
-Usage: python run_whatsapp_automation.py
+WhatsApp Automation Runner Script
+Simple wrapper to run the main WhatsApp automation script
 """
 
-import os
 import sys
-from datetime import datetime
-from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv('.env')
-
-# Import the main automation class
-from lead_automation_selenium_whatsapp import EnhancedLeadAutomation, opt_logger
+import os
+import subprocess
 
 def main():
-    """Run WhatsApp lead automation with real leads"""
-    print("🚀 WHATSAPP LEAD AUTOMATION - PRODUCTION MODE")
-    print("=" * 55)
-    print(f"📅 Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print()
-    
-    # Verify configuration
-    api_token = os.getenv('LEAD_API_TOKEN', '')
-    if not api_token or api_token == 'Token your_token_here':
-        print("❌ ERROR: Please update LEAD_API_TOKEN in your .env file")
-        print("   Get your token from the lead management system")
-        return False
-    
-    print("🔧 Configuration:")
-    print(f"   📊 Lead API: {os.getenv('LEAD_API_URL', 'Not set')}")
-    print(f"   📝 Log API: {os.getenv('LEAD_LOG_API_URL', 'Not set')}")
-    print(f"   🔒 API Token: {'✅ Set' if api_token else '❌ Missing'}")
-    print(f"   🧪 Test Mode: {'✅ ON' if os.getenv('USE_TEST_NUMBER', 'false').lower() == 'true' else '❌ OFF (Production)'}")
-    print()
-    
-    # Initialize automation
+    """Run the main WhatsApp automation script"""
     try:
-        print("🔧 Initializing WhatsApp automation...")
-        automation = EnhancedLeadAutomation()
+        # Get the directory where this script is located
+        script_dir = os.path.dirname(os.path.abspath(__file__))
         
-        print("🌐 Starting WhatsApp Web session...")
-        print("📱 Be ready to scan QR code if prompted!")
-        print()
+        # Path to the main automation script
+        main_script = os.path.join(script_dir, 'lead_automation_selenium_whatsapp.py')
         
-        # Start automation
-        success = automation.start_automation()
+        if not os.path.exists(main_script):
+            print("❌ ERROR: Main automation script not found!")
+            print(f"   Looking for: {main_script}")
+            print("   Make sure lead_automation_selenium_whatsapp.py is in the same directory")
+            input("Press Enter to exit...")
+            return 1
         
-        if success:
-            print("\n🎉 AUTOMATION COMPLETED SUCCESSFULLY!")
-            print("📊 Check the logs for detailed results")
-        else:
-            print("\n❌ AUTOMATION FAILED!")
-            print("🔧 Check the logs for error details")
+        print("🚀 Starting WhatsApp Multi-Team Automation...")
+        print(f"📂 Script location: {main_script}")
+        print("=" * 60)
         
-        return success
+        # Run the main script
+        result = subprocess.run([sys.executable, main_script], 
+                              cwd=script_dir,
+                              check=False)
+        
+        return result.returncode
         
     except KeyboardInterrupt:
-        print("\n🛑 AUTOMATION STOPPED BY USER")
-        return False
+        print("\n⏹️ Automation stopped by user")
+        return 0
     except Exception as e:
-        print(f"\n❌ AUTOMATION ERROR: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+        print(f"❌ ERROR: {str(e)}")
+        input("Press Enter to exit...")
+        return 1
 
 if __name__ == "__main__":
-    print("WhatsApp Lead Automation")
-    print("=" * 25)
-    print()
-    
-    # Warning message
-    print("⚠️  PRODUCTION MODE WARNING:")
-    print("   - This will send messages to REAL leads")
-    print("   - Make sure your API credentials are correct")
-    print("   - Ensure WhatsApp Web access is ready")
-    print()
-    
-    # Confirmation
-    confirm = input("Continue with production automation? (yes/no): ").strip().lower()
-    
-    if confirm in ['yes', 'y']:
-        success = main()
-        exit_code = 0 if success else 1
-        sys.exit(exit_code)
-    else:
-        print("🛑 Automation cancelled by user")
-        sys.exit(0)
+    exit_code = main()
+    sys.exit(exit_code)

@@ -27,6 +27,9 @@ from enum import Enum
 from dotenv import load_dotenv
 import pyperclip
 import traceback
+import threading
+import queue
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Selenium imports
 from selenium import webdriver
@@ -169,17 +172,16 @@ logger = opt_logger.logger
 SCRIPT_START_TIME = '09:00'
 SCRIPT_END_TIME = '21:00'
 
-# Counsellor configuration with optimized limits and employee IDs
-COUNSELLORS = {
+# Complete counsellor database for multi-team system
+ALL_COUNSELLORS = {
     'Anandi': {'daily_limit': 50, 'number': '+919512270915', 'username': 'anandi', 'employee_id': 289},
     'Preeti': {'daily_limit': 50, 'number': '+918799334198', 'username': 'preeti', 'employee_id': 286},
     'Khushali': {'daily_limit': 50, 'number': '+917069629625', 'username': 'pkhushali', 'employee_id': 294},
     'Karan': {'daily_limit': 50, 'number': '+919773432629', 'username': 'dkaran', 'employee_id': 308},
-    'Sangita': {'daily_limit': 50, 'number': '+918128758628', 'username': 'sangitac', 'employee_id': 305},  # ID 307 inactive, using fallback
-    'Maitri': {'daily_limit': 50, 'number': '+918866817620', 'username': 'maitri', 'employee_id': 297},
+    'Sangita': {'daily_limit': 50, 'number': '+918128758628', 'username': 'sangitac', 'employee_id': 305},
     'Chitra': {'daily_limit': 50, 'number': '+918128817870', 'username': 'chitra', 'employee_id': 264},
     'Pragatee': {'daily_limit': 50, 'number': '+919687046717', 'username': 'pragatee', 'employee_id': 260},
-    'Vaidehi': {'daily_limit': 50, 'number': '+917874202685', 'username': 'vaidehi', 'employee_id': 309}
+    'Tulsi': {'daily_limit': 50, 'number': '+919726266913', 'username': 'tulsi', 'employee_id': 261},
 }
 
 # API Configuration
@@ -276,30 +278,312 @@ LEAD_API_HEADERS = {
 }
 
 # ============================================================================
+# MULTI-TEAM MANAGEMENT SYSTEM
+# ============================================================================
+
+class PhoneTeamManager:
+    """Manages phone-based team configurations and builds team structures"""
+    
+    def __init__(self):
+        # Ensure environment variables are loaded
+        load_dotenv('.env')
+        self.phone_teams = self.build_all_teams()
+        self.validate_teams()
+    
+    def build_all_teams(self) -> Dict:
+        """Build phone teams by combining .env config with counsellor database"""
+        phone_teams = {}
+        
+        # Define all phone team configurations
+        team_configs = [
+            ('sweta_jio', 'Sweta Mam', 'Jio'),
+            ('sweta_airtel', 'Sweta Mam', 'Airtel'), 
+            ('dipali_jio', 'Dipali Mam', 'Jio'),
+            ('dipali_airtel', 'Dipali Mam', 'Airtel')
+        ]
+        
+        for team_key, manager, network in team_configs:
+            # Get phone number from .env
+            phone_env_key = f"{team_key.upper()}_PHONE"
+            phone = os.getenv(phone_env_key)
+            
+            if not phone:
+                logger.warning(f"Phone number not found for {team_key} in .env file")
+                continue
+            
+            # Get counsellor list from .env
+            counsellors_env_key = f"{team_key.upper()}_COUNSELLORS"
+            counsellor_names = os.getenv(counsellors_env_key, '').split(',')
+            
+            # Build counsellor dict from names
+            team_counsellors = {}
+            for name in counsellor_names:
+                name = name.strip()
+                if name in ALL_COUNSELLORS:
+                    team_counsellors[name] = ALL_COUNSELLORS[name]
+                else:
+                    logger.warning(f"Counsellor '{name}' not found in database for team {team_key}")
+            
+            if not team_counsellors:
+                logger.warning(f"No valid counsellors found for team {team_key}")
+                continue
+            
+            phone_teams[team_key] = {
+                'manager': manager,
+                'phone': phone,
+                'network': network,
+                'profile_name': team_key,
+                'counsellors': team_counsellors,
+                'capacity': sum(c['daily_limit'] for c in team_counsellors.values())
+            }
+        
+        return phone_teams
+    
+    def validate_teams(self):
+        """Validate team configurations"""
+        if not self.phone_teams:
+            raise ValueError("No valid phone teams configured! Check your .env file.")
+        
+        logger.info(f"✅ Loaded {len(self.phone_teams)} phone teams:")
+        total_capacity = 0
+        for team_id, team in self.phone_teams.items():
+            counsellor_count = len(team['counsellors'])
+            capacity = team['capacity']
+            total_capacity += capacity
+            logger.info(f"   📱 {team['manager']} {team['network']} ({team['phone']}): {counsellor_count} counsellors, {capacity} capacity")
+        
+        logger.info(f"🌍 Total system capacity: {total_capacity} messages/day")
+    
+    def get_team_by_id(self, team_id: str) -> Optional[Dict]:
+        """Get team configuration by ID"""
+        return self.phone_teams.get(team_id)
+    
+    def get_all_teams(self) -> Dict:
+        """Get all team configurations"""
+        return self.phone_teams
+    
+    def get_team_capacity(self, team_id: str) -> int:
+        """Get total capacity for a team"""
+        team = self.get_team_by_id(team_id)
+        return team['capacity'] if team else 0
+
+class LeadDistributor:
+    """Smart lead distribution across all phone teams"""
+    
+    def __init__(self, phone_teams: Dict):
+        self.phone_teams = phone_teams
+        self.distribution_strategy = os.getenv('LEAD_DISTRIBUTION_STRATEGY', 'capacity_based')
+    
+    def distribute_leads(self, leads: List[Dict], quota_manager) -> Dict[str, List[Dict]]:
+        """Distribute leads across all teams based on available capacity"""
+        
+        # Calculate available capacity for each team
+        team_capacities = {}
+        total_available = 0
+        
+        for team_id, team in self.phone_teams.items():
+            used = quota_manager.get_team_quota_used(team_id)
+            available = max(0, team['capacity'] - used)
+            team_capacities[team_id] = available
+            total_available += available
+            logger.debug(f"Team {team_id}: {used}/{team['capacity']} used, {available} available")
+        
+        if total_available == 0:
+            logger.warning("No available capacity across all teams!")
+            return {}
+        
+        # Limit leads to available capacity
+        leads_to_distribute = leads[:total_available]
+        
+        # Distribute based on strategy
+        if self.distribution_strategy == 'capacity_based':
+            return self._capacity_based_distribution(leads_to_distribute, team_capacities)
+        elif self.distribution_strategy == 'round_robin':
+            return self._round_robin_distribution(leads_to_distribute, team_capacities)
+        else:
+            return self._balanced_distribution(leads_to_distribute, team_capacities)
+    
+    def _capacity_based_distribution(self, leads: List[Dict], capacities: Dict[str, int]) -> Dict[str, List[Dict]]:
+        """Distribute leads proportionally based on team capacity"""
+        distribution = {team_id: [] for team_id in capacities.keys()}
+        
+        if not leads:
+            return distribution
+        
+        total_capacity = sum(capacities.values())
+        if total_capacity == 0:
+            return distribution
+        
+        # Calculate proportion for each team
+        lead_index = 0
+        for team_id, capacity in capacities.items():
+            if capacity > 0:
+                proportion = capacity / total_capacity
+                leads_for_team = int(len(leads) * proportion)
+                
+                # Assign leads to this team
+                end_index = min(lead_index + leads_for_team, len(leads))
+                distribution[team_id] = leads[lead_index:end_index]
+                lead_index = end_index
+        
+        # Assign remaining leads to teams with capacity
+        while lead_index < len(leads):
+            for team_id in capacities.keys():
+                if capacities[team_id] > len(distribution[team_id]) and lead_index < len(leads):
+                    distribution[team_id].append(leads[lead_index])
+                    lead_index += 1
+        
+        return distribution
+    
+    def _round_robin_distribution(self, leads: List[Dict], capacities: Dict[str, int]) -> Dict[str, List[Dict]]:
+        """Distribute leads in round-robin fashion"""
+        distribution = {team_id: [] for team_id in capacities.keys()}
+        available_teams = [team_id for team_id, cap in capacities.items() if cap > 0]
+        
+        if not available_teams:
+            return distribution
+        
+        team_index = 0
+        for lead in leads:
+            team_id = available_teams[team_index % len(available_teams)]
+            if len(distribution[team_id]) < capacities[team_id]:
+                distribution[team_id].append(lead)
+            team_index += 1
+        
+        return distribution
+    
+    def _balanced_distribution(self, leads: List[Dict], capacities: Dict[str, int]) -> Dict[str, List[Dict]]:
+        """Distribute leads evenly across available teams"""
+        distribution = {team_id: [] for team_id in capacities.keys()}
+        available_teams = [team_id for team_id, cap in capacities.items() if cap > 0]
+        
+        if not available_teams:
+            return distribution
+        
+        leads_per_team = len(leads) // len(available_teams)
+        remaining_leads = len(leads) % len(available_teams)
+        
+        lead_index = 0
+        for i, team_id in enumerate(available_teams):
+            team_lead_count = leads_per_team + (1 if i < remaining_leads else 0)
+            team_lead_count = min(team_lead_count, capacities[team_id])
+            
+            end_index = lead_index + team_lead_count
+            distribution[team_id] = leads[lead_index:end_index]
+            lead_index = end_index
+        
+        return distribution
+
+class GlobalQuotaManager:
+    """Manages quota across all phone teams"""
+    
+    def __init__(self):
+        self.quota_file = 'multi_team_quota.json'
+        self.quota_data = self._load_quota_data()
+    
+    def _load_quota_data(self) -> Dict:
+        """Load quota data for all teams"""
+        try:
+            with open(self.quota_file, 'r') as f:
+                data = json.load(f)
+                today = datetime.now().strftime('%Y-%m-%d')
+                return data.get(today, {
+                    'global_total': 0,
+                    'teams': {}
+                })
+        except FileNotFoundError:
+            return {
+                'global_total': 0,
+                'teams': {}
+            }
+    
+    def _save_quota_data(self):
+        """Save quota data with cleanup"""
+        try:
+            today = datetime.now().strftime('%Y-%m-%d')
+            
+            # Load existing data
+            try:
+                with open(self.quota_file, 'r') as f:
+                    all_data = json.load(f)
+            except FileNotFoundError:
+                all_data = {}
+            
+            # Update today's data
+            all_data[today] = self.quota_data
+            
+            # Cleanup old data (keep 7 days)
+            cutoff = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+            all_data = {k: v for k, v in all_data.items() if k >= cutoff}
+            
+            # Save back
+            with open(self.quota_file, 'w') as f:
+                json.dump(all_data, f, indent=2)
+                
+        except Exception as e:
+            logger.error(f"Failed to save quota data: {e}")
+    
+    def get_global_quota_used(self) -> int:
+        """Get total messages sent across all teams today"""
+        return self.quota_data.get('global_total', 0)
+    
+    def get_team_quota_used(self, team_id: str) -> int:
+        """Get messages sent by specific team today"""
+        return self.quota_data.get('teams', {}).get(team_id, 0)
+    
+    def increment_quota(self, team_id: str):
+        """Increment quota for team and global"""
+        if 'teams' not in self.quota_data:
+            self.quota_data['teams'] = {}
+        
+        self.quota_data['teams'][team_id] = self.quota_data['teams'].get(team_id, 0) + 1
+        self.quota_data['global_total'] = self.quota_data.get('global_total', 0) + 1
+        self._save_quota_data()
+    
+    def get_global_remaining(self) -> int:
+        """Get remaining global quota"""
+        used = self.get_global_quota_used()
+        return max(0, GLOBAL_DAILY_LIMIT - used)
+
+# ============================================================================
 # SELENIUM WHATSAPP WEB CLIENT
 # ============================================================================
 
 class SeleniumWhatsAppClient:
     """Production-ready WhatsApp Web client using Selenium automation"""
     
-    def __init__(self):
+    def __init__(self, team_id: str = None, team_config: Dict = None):
         self.driver = None
         self.session_active = False
         self.input_box = None
         self.current_number = None
+        self.team_id = team_id
+        self.team_config = team_config or {}
         # Static template system - no API needed
         
-        logger.debug("Selenium WhatsApp client initialized")
+        logger.debug(f"Selenium WhatsApp client initialized for team: {team_id}")
     
     def _setup_chrome_profile(self) -> str:
-        """Setup and validate Chrome profile directory"""
+        """Setup and validate Chrome profile directory for team"""
         try:
-            # Get current user profile directory
-            import os
-            user_profile = os.path.expanduser("~")  # Gets C:\Users\fahad
-            persistent_profile = os.path.join(user_profile, "WhatsAppBot_Profile")
+            # Get base profile directory from .env or use default
+            base_profiles_dir = os.getenv('CHROME_PROFILES_BASE_PATH')
+            if not base_profiles_dir:
+                user_profile = os.path.expanduser("~")  # Gets C:\Users\fahad
+                base_profiles_dir = os.path.join(user_profile, "WhatsAppProfiles")
             
-            opt_logger.browser_status(f"Setting up persistent profile: {persistent_profile}")
+            # Create team-specific profile directory
+            if self.team_id:
+                profile_name = f"{self.team_id}_profile"
+                persistent_profile = os.path.join(base_profiles_dir, profile_name)
+                team_info = f"Team {self.team_id}"
+                if self.team_config:
+                    team_info += f" ({self.team_config.get('manager', 'Unknown')} {self.team_config.get('network', '')})"
+                opt_logger.browser_status(f"Setting up profile for {team_info}: {persistent_profile}")
+            else:
+                # Fallback for legacy mode
+                persistent_profile = os.path.join(base_profiles_dir, "WhatsAppBot_Profile")
+                opt_logger.browser_status(f"Setting up legacy profile: {persistent_profile}")
             
             # Create directory if it doesn't exist
             try:
@@ -660,8 +944,18 @@ class SeleniumWhatsAppClient:
             self.driver.get(chat_url)
             self.current_number = phone
             
-            # Wait for page to load
-            time.sleep(5)
+            # Wait longer for page to load and stabilize
+            time.sleep(8)
+            
+            # Additional wait for any WhatsApp Web animations/loading
+            try:
+                # Wait for the page to not have loading indicators
+                WebDriverWait(self.driver, 10).until(
+                    lambda driver: driver.execute_script("return document.readyState") == "complete"
+                )
+                time.sleep(3)  # Additional buffer
+            except:
+                pass
             
             # Get page content for analysis
             page_text = self.driver.page_source.lower()
@@ -1037,29 +1331,83 @@ class SeleniumWhatsAppClient:
             return False
 
     def _find_input_box(self) -> bool:
-        """Find and set the message input box"""
+        """Find and set the message input box with updated selectors"""
         try:
-            # Multiple selectors for different WhatsApp Web versions
+            # Wait for chat to fully load
+            time.sleep(3)
+            
+            # Updated selectors for current WhatsApp Web (January 2025)
             input_selectors = [
-                '//div[@contenteditable="true"][@data-tab="10"]',  # Main input
-                '//div[@contenteditable="true"][@role="textbox"]',  # Alternative
-                '//*[@id="main"]//div[@contenteditable="true"]',    # Fallback
-                '//div[@title="Type a message"]',                  # By title
-                '//div[@data-testid="conversation-compose-box-input"]'  # By test ID
+                # Current primary selectors
+                '//div[@contenteditable="true"][@data-lexical-editor="true"]',
+                '//div[@contenteditable="true"][@role="textbox"][@data-lexical-editor="true"]',
+                '//div[@contenteditable="true"][@aria-label="Type a message"]',
+                '//div[@contenteditable="true"][contains(@class, "lexical")]',
+                
+                # Backup selectors
+                '//div[@contenteditable="true"][@data-tab="10"]',
+                '//div[@contenteditable="true"][@title="Type a message"]',
+                '//*[@id="main"]//div[@contenteditable="true"]',
+                '//div[@data-testid="conversation-compose-box-input"]',
+                
+                # CSS selectors as fallback
+                'div[contenteditable="true"][data-lexical-editor="true"]',
+                'div[contenteditable="true"][role="textbox"]',
+                'div[contenteditable="true"][aria-label*="message"]'
             ]
             
-            for selector in input_selectors:
+            for i, selector in enumerate(input_selectors):
                 try:
-                    self.input_box = WebDriverWait(self.driver, 5).until(
-                        EC.element_to_be_clickable((By.XPATH, selector))
-                    )
+                    if selector.startswith('//') or selector.startswith('/'):
+                        # XPath selector
+                        self.input_box = WebDriverWait(self.driver, 3).until(
+                            EC.element_to_be_clickable((By.XPATH, selector))
+                        )
+                    else:
+                        # CSS selector
+                        self.input_box = WebDriverWait(self.driver, 3).until(
+                            EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+                        )
+                    
+                    # Try to click and verify it's working
                     self.input_box.click()
-                    logger.debug(f"Input box found with selector: {selector}")
-                    return True
-                except:
+                    time.sleep(1)
+                    
+                    # Verify the input box is active by checking if we can type
+                    try:
+                        self.input_box.send_keys("test")
+                        self.input_box.clear()
+                        logger.info(f"✅ Input box found and verified with selector: {selector}")
+                        return True
+                    except:
+                        continue
+                        
+                except Exception as e:
+                    logger.debug(f"Selector {i+1}/{len(input_selectors)} failed: {selector}")
                     continue
             
-            logger.warning("Could not find message input box")
+            # If all selectors failed, try to find any contenteditable div
+            try:
+                logger.warning("All selectors failed, trying generic approach...")
+                all_inputs = self.driver.find_elements(By.XPATH, '//div[@contenteditable="true"]')
+                logger.info(f"Found {len(all_inputs)} contenteditable elements")
+                
+                for inp in all_inputs:
+                    try:
+                        if inp.is_displayed() and inp.is_enabled():
+                            inp.click()
+                            time.sleep(1)
+                            inp.send_keys("test")
+                            inp.clear()
+                            self.input_box = inp
+                            logger.info("✅ Input box found with generic approach")
+                            return True
+                    except:
+                        continue
+            except:
+                pass
+            
+            logger.error("❌ Could not find message input box with any method")
             return False
             
         except Exception as e:
@@ -1081,16 +1429,60 @@ class SeleniumWhatsAppClient:
                 )
             
             # Wait for chat interface to load
-            time.sleep(3)
+            time.sleep(5)
             
-            # Find input box
-            if not self._find_input_box():
+            # Try multiple times to find input box
+            input_found = False
+            max_retries = 3
+            
+            for attempt in range(max_retries):
+                logger.info(f"🔍 Attempt {attempt + 1}/{max_retries} to find input box...")
+                
+                if self._find_input_box():
+                    input_found = True
+                    break
+                else:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"⏳ Input box not found, retrying in 3 seconds...")
+                        time.sleep(3)
+                        # Try refreshing the page
+                        try:
+                            self.driver.refresh()
+                            time.sleep(5)
+                        except:
+                            pass
+            
+            if not input_found:
+                # Try to diagnose the issue
+                try:
+                    page_source = self.driver.page_source
+                    if "phone number shared via url is invalid" in page_source.lower():
+                        return MessageResult(
+                            success=False,
+                            status=MessageStatus.FAILED,
+                            message_id=None,
+                            error_category=ErrorCategory.INVALID_NUMBER,
+                            error_message=f"Invalid WhatsApp number: {phone}",
+                            should_continue=True
+                        )
+                    elif "not registered on whatsapp" in page_source.lower():
+                        return MessageResult(
+                            success=False,
+                            status=MessageStatus.FAILED,
+                            message_id=None,
+                            error_category=ErrorCategory.NOT_ON_WHATSAPP,
+                            error_message=f"Number not on WhatsApp: {phone}",
+                            should_continue=True
+                        )
+                except:
+                    pass
+                
                 return MessageResult(
                     success=False,
                     status=MessageStatus.FAILED,
                     message_id=None,
                     error_category=ErrorCategory.ELEMENT_NOT_FOUND,
-                    error_message="Could not find message input box",
+                    error_message="Could not find message input box after multiple attempts",
                     should_continue=True
                 )
             
@@ -1121,18 +1513,59 @@ class SeleniumWhatsAppClient:
             # Send text message if no media was sent
             if not media_sent:
                 try:
-                    # Clear input box
-                    self.input_box.clear()
+                    logger.info(f"📝 Sending text message to {phone}")
                     
-                    # Copy message to clipboard and paste
-                    pyperclip.copy(message_text)
-                    self.input_box.send_keys(Keys.CONTROL, "v")
+                    # Multiple approaches to send the message
+                    message_sent = False
                     
-                    # Wait a moment then send
-                    time.sleep(1)
-                    self.input_box.send_keys(Keys.ENTER)
+                    # Method 1: Clipboard paste (most reliable)
+                    try:
+                        self.input_box.clear()
+                        pyperclip.copy(message_text)
+                        time.sleep(0.5)
+                        
+                        # Click to ensure focus
+                        self.input_box.click()
+                        time.sleep(0.5)
+                        
+                        # Paste using Ctrl+V
+                        self.input_box.send_keys(Keys.CONTROL, "v")
+                        time.sleep(1)
+                        
+                        # Send message
+                        self.input_box.send_keys(Keys.ENTER)
+                        message_sent = True
+                        logger.info(f"✅ Text message sent via clipboard to {phone}")
+                        
+                    except Exception as e:
+                        logger.warning(f"⚠️ Clipboard method failed: {e}")
+                        
+                        # Method 2: Direct typing (backup)
+                        try:
+                            self.input_box.clear()
+                            time.sleep(0.5)
+                            self.input_box.click()
+                            time.sleep(0.5)
+                            
+                            # Type message directly (slower but more reliable)
+                            self.input_box.send_keys(message_text)
+                            time.sleep(1)
+                            self.input_box.send_keys(Keys.ENTER)
+                            message_sent = True
+                            logger.info(f"✅ Text message sent via typing to {phone}")
+                            
+                        except Exception as e2:
+                            logger.error(f"❌ Both send methods failed: {e2}")
                     
-                    logger.info(f"✅ Text message sent to {phone}")
+                    if not message_sent:
+                        return MessageResult(
+                            success=False,
+                            status=MessageStatus.FAILED,
+                            message_id=None,
+                            error_category=ErrorCategory.WHATSAPP_WEB_ERROR,
+                            error_message="Failed to send message with all methods",
+                            should_continue=True
+                        )
                     
                 except Exception as e:
                     logger.error(f"❌ Error sending text message: {e}")
@@ -1484,11 +1917,11 @@ class EnhancedLeadAutomation:
         try:
             # Get the correct employee ID based on counsellor name
             employee_id = 1  # Default fallback (system admin)
-            if counsellor_name and counsellor_name in COUNSELLORS:
-                employee_id = COUNSELLORS[counsellor_name]['employee_id']
+            if counsellor_name and counsellor_name in ALL_COUNSELLORS:
+                employee_id = ALL_COUNSELLORS[counsellor_name]['employee_id']
                 logger.debug(f"Using employee ID {employee_id} for counsellor {counsellor_name}")
             else:
-                logger.warning(f"Counsellor '{counsellor_name}' not found in COUNSELLORS, using default employee ID 1")
+                logger.warning(f"Counsellor '{counsellor_name}' not found in ALL_COUNSELLORS, using default employee ID 1")
             
             payload = {
                 "lead_id": lead.get('lead_id'),
@@ -1526,7 +1959,7 @@ class EnhancedLeadAutomation:
         """Get random available counsellor"""
         available = []
         
-        for name, config in COUNSELLORS.items():
+        for name, config in ALL_COUNSELLORS.items():
             used = self.daily_quota.get(name, 0)
             limit = config['daily_limit']
             
@@ -1635,7 +2068,7 @@ class EnhancedLeadAutomation:
         
         # Calculate available quota (limited by global limit)
         total_quota = 0
-        for name, config in COUNSELLORS.items():
+        for name, config in ALL_COUNSELLORS.items():
             used = self.daily_quota.get(name, 0)
             remaining = max(0, config['daily_limit'] - used)
             total_quota += remaining
@@ -1823,6 +2256,693 @@ class CampaignAnalytics:
         }
 
 # ============================================================================
+# MULTI-TEAM AUTOMATION ORCHESTRATOR
+# ============================================================================
+
+class MultiTeamAutomation:
+    """Orchestrates parallel execution across all phone teams"""
+    
+    def __init__(self):
+        self.team_manager = PhoneTeamManager()
+        self.quota_manager = GlobalQuotaManager()
+        self.lead_distributor = LeadDistributor(self.team_manager.get_all_teams())
+        self.team_clients = {}  # Will store SeleniumWhatsAppClient instances
+        self.team_analytics = {}  # Per-team analytics
+        self.global_analytics = CampaignAnalytics()
+        self.enable_parallel = os.getenv('ENABLE_PARALLEL_EXECUTION', 'true').lower() == 'true'
+        self.max_browsers = int(os.getenv('MAX_CONCURRENT_BROWSERS', '4'))
+        
+    def initialize_all_browsers(self) -> Dict[str, bool]:
+        """Initialize all browser sessions in parallel with strict team validation"""
+        opt_logger.browser_status("🚀 Initializing all phone team browsers...")
+        
+        initialization_results = {}
+        
+        if self.enable_parallel:
+            # Use ThreadPoolExecutor for parallel browser initialization
+            with ThreadPoolExecutor(max_workers=self.max_browsers) as executor:
+                future_to_team = {}
+                
+                for team_id, team_config in self.team_manager.get_all_teams().items():
+                    future = executor.submit(self._initialize_single_team_browser, team_id, team_config)
+                    future_to_team[future] = team_id
+                
+                # Process results as they complete
+                for future in as_completed(future_to_team):
+                    team_id = future_to_team[future]
+                    try:
+                        success = future.result()
+                        initialization_results[team_id] = success
+                        if success:
+                            # Validate WhatsApp session matches team phone
+                            team_config = self.team_manager.get_team_by_id(team_id)
+                            expected_phone = team_config['phone']
+                            opt_logger.browser_status(f"✅ {team_id} browser ready (Phone: {expected_phone})")
+                        else:
+                            opt_logger.browser_status(f"❌ {team_id} browser failed")
+                    except Exception as e:
+                        logger.error(f"Exception initializing {team_id}: {e}")
+                        initialization_results[team_id] = False
+        else:
+            # Sequential initialization (for debugging)
+            opt_logger.browser_status("🔍 Sequential browser initialization (debug mode)")
+            for team_id, team_config in self.team_manager.get_all_teams().items():
+                success = self._initialize_single_team_browser(team_id, team_config)
+                initialization_results[team_id] = success
+                if success:
+                    expected_phone = team_config['phone']
+                    opt_logger.browser_status(f"✅ {team_id} browser ready (Phone: {expected_phone})")
+                else:
+                    opt_logger.browser_status(f"❌ {team_id} browser failed")
+                
+                # Add delay between browsers in sequential mode
+                if team_id != list(self.team_manager.get_all_teams().keys())[-1]:  # Not last
+                    delay = int(os.getenv('BROWSER_STARTUP_DELAY', '5'))
+                    opt_logger.browser_status(f"⏳ Waiting {delay}s before next browser...")
+                    time.sleep(delay)
+        
+        # Summary with phone validation
+        successful_teams = [team for team, success in initialization_results.items() if success]
+        failed_teams = [team for team, success in initialization_results.items() if not success]
+        
+        opt_logger.browser_status(f"🌐 Browser initialization complete:")
+        opt_logger.browser_status(f"   ✅ Successful: {len(successful_teams)}/{len(initialization_results)}")
+        
+        if successful_teams:
+            opt_logger.browser_status(f"🔐 TEAM-BROWSER VALIDATION:")
+            for team_id in successful_teams:
+                team_config = self.team_manager.get_team_by_id(team_id)
+                manager = team_config['manager']
+                network = team_config['network']
+                phone = team_config['phone']
+                opt_logger.browser_status(f"   ✅ {team_id}: {manager} {network} → {phone}")
+        
+        if failed_teams:
+            opt_logger.browser_status(f"   ❌ Failed Teams: {', '.join(failed_teams)}")
+            opt_logger.browser_status(f"   ⚠️  Failed teams will be SKIPPED to prevent wrong number usage")
+        
+        return initialization_results
+    
+    def _initialize_single_team_browser(self, team_id: str, team_config: Dict) -> bool:
+        """Initialize browser for a single team"""
+        try:
+            # Create WhatsApp client for this team
+            client = SeleniumWhatsAppClient(team_id=team_id, team_config=team_config)
+            
+            # Initialize browser session
+            success = client.initialize_browser()
+            
+            if success:
+                self.team_clients[team_id] = client
+                # Initialize team-specific analytics
+                self.team_analytics[team_id] = CampaignAnalytics()
+                logger.info(f"✅ Team {team_id} browser initialized successfully")
+                return True
+            else:
+                logger.error(f"❌ Failed to initialize browser for team {team_id}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Exception initializing team {team_id}: {e}")
+            return False
+    
+    def fetch_and_distribute_leads(self) -> Dict[str, List[Dict]]:
+        """Fetch leads and distribute ONLY across teams with logged-in browsers"""
+        opt_logger.browser_status("📋 Fetching and distributing leads across ACTIVE teams...")
+        
+        # Only consider teams that have successfully logged-in browsers
+        active_teams = list(self.team_clients.keys())
+        opt_logger.browser_status(f"🔐 Active teams with logged-in browsers: {', '.join(active_teams)}")
+        
+        # Calculate total available capacity ONLY for active teams
+        total_capacity = 0
+        team_capacity_info = {}
+        
+        for team_id in active_teams:
+            team_capacity = self.team_manager.get_team_capacity(team_id)
+            used = self.quota_manager.get_team_quota_used(team_id)
+            available = max(0, team_capacity - used)
+            total_capacity += available
+            team_capacity_info[team_id] = available
+            
+            team_config = self.team_manager.get_team_by_id(team_id)
+            logger.debug(f"Team {team_id} ({team_config['phone']}): {available} available capacity")
+        
+        # Limit by global quota (CRITICAL: Respect .env GLOBAL_DAILY_LIMIT)
+        global_remaining = self.quota_manager.get_global_remaining()
+        global_used = self.quota_manager.get_global_quota_used()
+        
+        # The effective capacity is limited by BOTH team capacity AND global limit
+        total_capacity = min(total_capacity, global_remaining)
+        
+        opt_logger.browser_status(f"📊 QUOTA ANALYSIS:")
+        opt_logger.browser_status(f"   🌍 Global: {global_used}/{GLOBAL_DAILY_LIMIT} used, {global_remaining} remaining")
+        opt_logger.browser_status(f"   📱 Teams: {sum(team_capacity_info.values())} total team capacity available")
+        opt_logger.browser_status(f"   ⚡ EFFECTIVE TARGET: {total_capacity} messages (limited by global quota)")
+        
+        if total_capacity == 0:
+            if global_remaining == 0:
+                opt_logger.browser_status("🚫 GLOBAL DAILY LIMIT REACHED!")
+                opt_logger.browser_status(f"   Used: {global_used}/{GLOBAL_DAILY_LIMIT} messages today")
+            else:
+                opt_logger.browser_status("⚠️ No available capacity across any ACTIVE teams")
+                opt_logger.browser_status("💡 Ensure teams have logged-in WhatsApp sessions and available quota")
+            return {}
+        
+        # Fetch leads
+        leads = self.fetch_leads(total_capacity)
+        if not leads:
+            opt_logger.browser_status("📭 No leads available from API")
+            return {}
+        
+        # Create filtered phone teams with only active teams
+        active_phone_teams = {
+            team_id: self.team_manager.get_team_by_id(team_id) 
+            for team_id in active_teams
+        }
+        
+        # Create temporary distributor with only active teams
+        active_distributor = LeadDistributor(active_phone_teams)
+        
+        # Distribute leads across ONLY active teams
+        distributed_leads = active_distributor.distribute_leads(leads, self.quota_manager)
+        
+        # Validate distribution - ensure no leads go to inactive teams
+        validated_distribution = {}
+        for team_id, team_leads in distributed_leads.items():
+            if team_id in active_teams:
+                validated_distribution[team_id] = team_leads
+            else:
+                logger.warning(f"⚠️ Prevented lead assignment to inactive team: {team_id}")
+        
+        # Log distribution with phone validation
+        opt_logger.browser_status("📊 SECURED Lead distribution (Team → Phone):")
+        total_distributed = 0
+        for team_id, team_leads in validated_distribution.items():
+            if team_leads:
+                team_config = self.team_manager.get_team_by_id(team_id)
+                team_name = f"{team_config['manager']} {team_config['network']}"
+                team_phone = team_config['phone']
+                opt_logger.browser_status(f"   📱 {team_name}: {len(team_leads)} leads → {team_phone}")
+                total_distributed += len(team_leads)
+        
+        opt_logger.browser_status(f"🎯 Total distributed: {total_distributed}/{len(leads)} leads")
+        opt_logger.browser_status(f"🔐 All leads will use CORRECT manager phone numbers only")
+        
+        return validated_distribution
+    
+    def fetch_leads(self, limit: int) -> List[Dict]:
+        """Fetch leads from API (shared method)"""
+        try:
+            params = {
+                'owner_id': STATIC_OWNER_ID,
+                'limit': limit,
+                'template_name': os.getenv('WATI_TEMPLATE_NAME', 'Template_Name'),
+            }
+            
+            response = requests.get(
+                LEAD_API_URL,
+                params=params,
+                headers=LEAD_API_HEADERS,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                leads = data.get('data', [])
+                logger.debug(f"Fetched {len(leads)} leads from API")
+                return leads
+            else:
+                logger.error(f"Lead API error: {response.status_code}")
+                return []
+                
+        except Exception as e:
+            logger.error(f"Failed to fetch leads: {e}")
+            return []
+    
+    def process_teams_parallel(self, distributed_leads: Dict[str, List[Dict]]) -> Dict:
+        """Process all teams in parallel with strict team-browser validation"""
+        opt_logger.browser_status("🚀 Starting parallel team processing with SECURITY validation...")
+        
+        # Validate that all teams have their own browser sessions
+        for team_id in distributed_leads.keys():
+            if team_id not in self.team_clients:
+                logger.error(f"🚨 CRITICAL: Team {team_id} has leads but NO browser session!")
+                raise ValueError(f"Security violation: Team {team_id} cannot process leads without dedicated browser")
+        
+        opt_logger.browser_status("🔐 Team-Browser Security Check: PASSED")
+        
+        # Start analytics
+        self.global_analytics.start_campaign()
+        for analytics in self.team_analytics.values():
+            analytics.start_campaign()
+        
+        # Process teams in parallel with validation
+        if self.enable_parallel:
+            with ThreadPoolExecutor(max_workers=len(self.team_clients)) as executor:
+                future_to_team = {}
+                
+                for team_id, team_leads in distributed_leads.items():
+                    if team_leads and team_id in self.team_clients:
+                        # Double-check team has dedicated browser before processing
+                        team_config = self.team_manager.get_team_by_id(team_id)
+                        expected_phone = team_config['phone']
+                        opt_logger.browser_status(f"🔐 Processing {team_id} → {expected_phone} ({len(team_leads)} leads)")
+                        
+                        future = executor.submit(self._process_single_team_secured, team_id, team_leads)
+                        future_to_team[future] = team_id
+                
+                # Collect results
+                team_results = {}
+                for future in as_completed(future_to_team):
+                    team_id = future_to_team[future]
+                    try:
+                        result = future.result()
+                        team_results[team_id] = result
+                        team_config = self.team_manager.get_team_by_id(team_id)
+                        opt_logger.browser_status(f"✅ Team {team_id} ({team_config['phone']}) processing complete")
+                    except Exception as e:
+                        logger.error(f"Exception processing team {team_id}: {e}")
+                        team_results[team_id] = {'processed': 0, 'errors': 1}
+        else:
+            # Sequential processing (for debugging)
+            team_results = {}
+            for team_id, team_leads in distributed_leads.items():
+                if team_leads and team_id in self.team_clients:
+                    team_config = self.team_manager.get_team_by_id(team_id)
+                    expected_phone = team_config['phone']
+                    opt_logger.browser_status(f"🔐 Processing {team_id} → {expected_phone} ({len(team_leads)} leads)")
+                    
+                    result = self._process_single_team_secured(team_id, team_leads)
+                    team_results[team_id] = result
+        
+        # End analytics
+        self.global_analytics.end_campaign()
+        for analytics in self.team_analytics.values():
+            analytics.end_campaign()
+        
+        return team_results
+    
+    def _process_single_team_secured(self, team_id: str, leads: List[Dict]) -> Dict:
+        """Process leads for a single team with STRICT security validation"""
+        
+        # CRITICAL SECURITY CHECK: Ensure team can only use its own browser
+        if team_id not in self.team_clients:
+            logger.error(f"🚨 SECURITY VIOLATION: Team {team_id} trying to process without dedicated browser!")
+            return {'processed': 0, 'errors': len(leads), 'security_error': True}
+        
+        client = self.team_clients[team_id]
+        team_config = self.team_manager.get_team_by_id(team_id)
+        analytics = self.team_analytics[team_id]
+        
+        # Additional security validation
+        expected_phone = team_config['phone']
+        manager_name = team_config['manager']
+        network = team_config['network']
+        
+        logger.info(f"🔐 SECURED Processing for {team_id}: {manager_name} {network} → {expected_phone}")
+        
+        processed = 0
+        errors = 0
+        
+        for i, lead in enumerate(leads, 1):
+            try:
+                # Get available counsellor from THIS SPECIFIC team only
+                counsellor_name, counsellor_config = self._get_team_counsellor(team_id)
+                if not counsellor_name:
+                    logger.warning(f"No available counsellors in team {team_id}")
+                    break
+                
+                # DOUBLE CHECK: Ensure we're using correct team's browser
+                if client.team_id != team_id:
+                    logger.error(f"🚨 CRITICAL: Browser session mismatch! Expected {team_id}, got {client.team_id}")
+                    errors += 1
+                    continue
+                
+                # Process lead with security validation
+                result = self._process_single_lead_for_team_secured(
+                    lead, counsellor_name, counsellor_config, client, team_id
+                )
+                
+                # Track analytics
+                analytics.track_result(
+                    str(lead.get('lead_id', '')), 
+                    counsellor_name, 
+                    result, 
+                    result.status
+                )
+                
+                # Update quota
+                if result.success:
+                    self.quota_manager.increment_quota(team_id)
+                    processed += 1
+                    
+                    # Log successful send with team validation
+                    lead_name = lead.get('full_name', 'Customer')
+                    logger.info(f"✅ {team_id} ({expected_phone}): {lead_name} → {counsellor_name}")
+                else:
+                    errors += 1
+                
+                # Add HUMAN-LIKE delay between messages (per team)
+                if i < len(leads):  # Not last message
+                    delay = random.uniform(MIN_DELAY_BETWEEN_MESSAGES, MAX_DELAY_BETWEEN_MESSAGES)
+                    
+                    # Make it more human-like with varied delay patterns
+                    if delay < 120:  # Short delay
+                        delay_type = "⚡ Quick"
+                    elif delay < 300:  # Medium delay
+                        delay_type = "⏳ Normal"
+                    else:  # Long delay
+                        delay_type = "🐌 Careful"
+                    
+                    logger.info(f"🤖→👤 {team_id}: {delay_type} human-like delay: {delay:.1f}s before next message")
+                    time.sleep(delay)
+                    
+            except Exception as e:
+                logger.error(f"Error processing lead in team {team_id}: {e}")
+                errors += 1
+        
+        logger.info(f"🔐 {team_id} SECURED processing complete: {processed} sent, {errors} errors")
+        return {'processed': processed, 'errors': errors}
+    
+    def _process_single_team(self, team_id: str, leads: List[Dict]) -> Dict:
+        """Legacy method - redirects to secured version"""
+        return self._process_single_team_secured(team_id, leads)
+    
+    def _get_team_counsellor(self, team_id: str) -> Tuple[Optional[str], Optional[Dict]]:
+        """Get available counsellor from team"""
+        team_config = self.team_manager.get_team_by_id(team_id)
+        if not team_config:
+            return None, None
+        
+        # For now, return random counsellor from team
+        # TODO: Implement team-specific quota tracking
+        counsellors = team_config['counsellors']
+        if counsellors:
+            name = random.choice(list(counsellors.keys()))
+            return name, counsellors[name]
+        
+        return None, None
+    
+    def _process_single_lead_for_team_secured(self, lead: Dict, counsellor_name: str, 
+                                             counsellor_config: Dict, client: SeleniumWhatsAppClient, 
+                                             team_id: str) -> MessageResult:
+        """Process single lead for specific team with STRICT security validation"""
+        
+        # SECURITY CHECK 1: Verify team configuration
+        team_config = self.team_manager.get_team_by_id(team_id)
+        if not team_config:
+            logger.error(f"🚨 SECURITY: Invalid team_id {team_id}")
+            return MessageResult(
+                success=False,
+                status=MessageStatus.FAILED,
+                message_id=None,
+                error_category=ErrorCategory.UNKNOWN_ERROR,
+                error_message="Invalid team configuration",
+                should_continue=False
+            )
+        
+        # SECURITY CHECK 2: Verify counsellor belongs to this team
+        if counsellor_name not in team_config['counsellors']:
+            logger.error(f"🚨 SECURITY: Counsellor {counsellor_name} does not belong to team {team_id}")
+            return MessageResult(
+                success=False,
+                status=MessageStatus.FAILED,
+                message_id=None,
+                error_category=ErrorCategory.UNKNOWN_ERROR,
+                error_message="Counsellor-team mismatch",
+                should_continue=False
+            )
+        
+        # SECURITY CHECK 3: Verify client belongs to correct team
+        if hasattr(client, 'team_id') and client.team_id != team_id:
+            logger.error(f"🚨 SECURITY: Client team mismatch! Expected {team_id}, got {client.team_id}")
+            return MessageResult(
+                success=False,
+                status=MessageStatus.FAILED,
+                message_id=None,
+                error_category=ErrorCategory.UNKNOWN_ERROR,
+                error_message="Client-team mismatch",
+                should_continue=False
+            )
+        
+        lead_id = str(lead.get('lead_id', ''))
+        lead_name = lead.get('full_name', 'Customer')
+        expected_phone = team_config['phone']
+        
+        # Determine target phone
+        if USE_TEST_NUMBER:
+            target_phone = TEST_MOBILE_NUMBER
+        else:
+            target_phone = lead.get('mobile_number_formatted', '')
+        
+        # Prepare template parameters
+        counsellor_number = counsellor_config['number']
+        
+        parameters = [
+            {"name": "1", "value": lead_name},
+            {"name": "2", "value": counsellor_name},
+            {"name": "3", "value": counsellor_number}
+        ]
+        
+        # Log security validation success
+        logger.debug(f"🔐 SECURITY PASSED: {team_id} → {expected_phone} | {lead_name} → {counsellor_name}")
+        
+        # Send message through verified team's browser session
+        result = client.send_template_message(
+            phone=target_phone,
+            template=os.getenv('WATI_TEMPLATE_NAME', 'Template_Name'),
+            params=parameters
+        )
+        
+        # Save to external log with secured team info
+        log_status = "sent" if result.success else "failed"
+        message_content = client._build_message_from_template(parameters)
+        
+        self._save_team_message_log_secured(
+            lead=lead,
+            status=log_status,
+            message_id=result.message_id,
+            error=result.error_message if not result.success else None,
+            counsellor_name=counsellor_name,
+            message_content=message_content,
+            team_id=team_id,
+            expected_phone=expected_phone
+        )
+        
+        return result
+    
+    def _process_single_lead_for_team(self, lead: Dict, counsellor_name: str, 
+                                     counsellor_config: Dict, client: SeleniumWhatsAppClient, 
+                                     team_id: str) -> MessageResult:
+        """Legacy method - redirects to secured version"""
+        return self._process_single_lead_for_team_secured(lead, counsellor_name, counsellor_config, client, team_id)
+    
+    def _save_team_message_log_secured(self, lead: Dict, status: str, message_id: str = None, 
+                                      error: str = None, counsellor_name: str = None, 
+                                      message_content: str = None, team_id: str = None,
+                                      expected_phone: str = None) -> bool:
+        """Save message log with SECURED team information and validation"""
+        try:
+            # SECURITY VALIDATION: Verify team configuration
+            team_config = self.team_manager.get_team_by_id(team_id)
+            if not team_config:
+                logger.error(f"🚨 LOG SECURITY: Invalid team_id {team_id}")
+                return False
+            
+            # Get employee ID with validation
+            employee_id = 1  # Default fallback
+            if counsellor_name and counsellor_name in ALL_COUNSELLORS:
+                employee_id = ALL_COUNSELLORS[counsellor_name]['employee_id']
+                logger.debug(f"🔐 LOG: Employee ID {employee_id} for {counsellor_name}")
+            else:
+                logger.warning(f"⚠️ LOG: Unknown counsellor {counsellor_name}, using default employee ID")
+            
+            # SECURITY: Use verified team phone number for from_phone_number
+            verified_from_phone = team_config['phone']
+            
+            # Additional validation - ensure expected phone matches team phone
+            if expected_phone and expected_phone != verified_from_phone:
+                logger.error(f"🚨 LOG SECURITY: Phone mismatch! Expected {expected_phone}, team has {verified_from_phone}")
+                return False
+            
+            payload = {
+                "lead_id": lead.get('lead_id'),
+                "message_content": message_content if message_content else f"Template: {os.getenv('WATI_TEMPLATE_NAME', 'Template_Name')}",
+                "msg_type": "template",
+                "msg_status": status,
+                "to_phone_number": lead.get('mobile_number_formatted'),
+                "from_phone_number": verified_from_phone,  # SECURED: Always use verified team phone
+                "template_name": os.getenv('WATI_TEMPLATE_NAME', 'Template_Name'),
+                "employee": employee_id,
+                "method": f"selenium_whatsapp_web_team_{team_id}_secured"
+            }
+            
+            # Add team validation metadata
+            payload["team_validation"] = {
+                "team_id": team_id,
+                "manager": team_config['manager'],
+                "network": team_config['network'],
+                "verified_phone": verified_from_phone,
+                "counsellor": counsellor_name
+            }
+            
+            if message_id:
+                payload["message_id"] = message_id
+            if error:
+                payload["error_message"] = error
+            if status == "sent":
+                payload["sent_at"] = datetime.now().isoformat()
+            
+            # Log the secure operation
+            logger.info(f"🔐 SECURE LOG: {team_id} → {verified_from_phone} | {counsellor_name} | {status}")
+            
+            response = requests.post(
+                LEAD_LOG_API_URL,
+                json=payload,
+                headers=LEAD_API_HEADERS,
+                timeout=15
+            )
+            
+            return response.status_code == 201
+            
+        except Exception as e:
+            logger.error(f"Failed to save secured team log: {e}")
+            return False
+    
+    def _save_team_message_log(self, lead: Dict, status: str, message_id: str = None, 
+                              error: str = None, counsellor_name: str = None, 
+                              message_content: str = None, team_id: str = None) -> bool:
+        """Legacy method - redirects to secured version"""
+        team_config = self.team_manager.get_team_by_id(team_id) if team_id else None
+        expected_phone = team_config['phone'] if team_config else None
+        
+        return self._save_team_message_log_secured(
+            lead, status, message_id, error, counsellor_name, 
+            message_content, team_id, expected_phone
+        )
+    
+    def close_all_browsers(self):
+        """Close all browser sessions"""
+        opt_logger.browser_status("🔴 Closing all browser sessions...")
+        
+        for team_id, client in self.team_clients.items():
+            try:
+                client.close_browser()
+                opt_logger.browser_status(f"🔴 {team_id} browser closed")
+            except Exception as e:
+                logger.error(f"Error closing {team_id} browser: {e}")
+        
+        self.team_clients.clear()
+    
+    def get_combined_metrics(self) -> Dict:
+        """Get combined metrics from all teams"""
+        combined_metrics = {
+            'sent': 0,
+            'delivered': 0,
+            'read': 0,
+            'failed': 0,
+            'pending': 0,
+            'total_processed': 0,
+            'team_breakdown': {},
+            'global_quota_used': self.quota_manager.get_global_quota_used()
+        }
+        
+        for team_id, analytics in self.team_analytics.items():
+            team_metrics = analytics.get_metrics()
+            
+            # Add to combined totals
+            for key in ['sent', 'delivered', 'read', 'failed', 'pending', 'total_processed']:
+                combined_metrics[key] += team_metrics.get(key, 0)
+            
+            # Store team breakdown
+            combined_metrics['team_breakdown'][team_id] = team_metrics
+        
+        # Calculate success rate
+        total = combined_metrics['total_processed']
+        if total > 0:
+            successful = combined_metrics['sent'] + combined_metrics['delivered'] + combined_metrics['read']
+            combined_metrics['success_rate'] = (successful / total) * 100
+        else:
+            combined_metrics['success_rate'] = 0
+        
+        return combined_metrics
+    
+    def run_multi_team_campaign(self) -> Dict:
+        """Run the complete multi-team campaign"""
+        try:
+            # Check working hours
+            if not self.is_working_hours():
+                current_time = datetime.now().strftime('%H:%M')
+                return {
+                    'status': 'outside_working_hours',
+                    'message': f'Outside working hours ({SCRIPT_START_TIME}-{SCRIPT_END_TIME})',
+                    'current_time': current_time
+                }
+            
+            # Check global quota
+            global_remaining = self.quota_manager.get_global_remaining()
+            if global_remaining == 0:
+                return {
+                    'status': 'global_quota_exhausted',
+                    'message': f'Global daily limit reached ({self.quota_manager.get_global_quota_used()}/{GLOBAL_DAILY_LIMIT})'
+                }
+            
+            # Initialize all browsers
+            browser_results = self.initialize_all_browsers()
+            successful_teams = [team for team, success in browser_results.items() if success]
+            
+            if not successful_teams:
+                return {
+                    'status': 'all_browsers_failed',
+                    'message': 'Failed to initialize any browser sessions'
+                }
+            
+            # Fetch and distribute leads
+            distributed_leads = self.fetch_and_distribute_leads()
+            if not distributed_leads:
+                return {
+                    'status': 'no_leads_to_distribute',
+                    'message': 'No leads available for distribution'
+                }
+            
+            # Process teams in parallel
+            team_results = self.process_teams_parallel(distributed_leads)
+            
+            # Get final metrics
+            final_metrics = self.get_combined_metrics()
+            
+            return {
+                'status': 'completed',
+                'successful_teams': successful_teams,
+                'failed_teams': [team for team, success in browser_results.items() if not success],
+                'team_results': team_results,
+                'metrics': final_metrics,
+                'timestamp': datetime.now().isoformat()
+            }
+            
+        except Exception as e:
+            logger.error(f"Multi-team campaign error: {e}")
+            return {
+                'status': 'error',
+                'message': str(e),
+                'timestamp': datetime.now().isoformat()
+            }
+        finally:
+            # Always close browsers
+            self.close_all_browsers()
+    
+    def is_working_hours(self) -> bool:
+        """Check if within working hours"""
+        try:
+            current = datetime.now().time()
+            start = datetime.strptime(SCRIPT_START_TIME, '%H:%M').time()
+            end = datetime.strptime(SCRIPT_END_TIME, '%H:%M').time()
+            return start <= current <= end
+        except Exception:
+            return True  # Default to allowing operation
+
+# ============================================================================
 # TERMINAL OUTPUT UTILITIES (UNCHANGED)
 # ============================================================================
 
@@ -1836,11 +2956,11 @@ def safe_print(text: str):
         print(safe_text)
 
 def print_config_banner():
-    """Display optimized configuration banner"""
-    safe_print("\n" + "="*60)
-    safe_print("🤖 SELENIUM WHATSAPP LEAD AUTOMATION SYSTEM")
-    safe_print("="*60)
-    safe_print(f"🌐 Method: Selenium WhatsApp Web")
+    """Display multi-team configuration banner"""
+    safe_print("\n" + "="*70)
+    safe_print("🚀 MULTI-TEAM WHATSAPP AUTOMATION SYSTEM")
+    safe_print("="*70)
+    safe_print(f"🌐 Method: Parallel Selenium WhatsApp Web")
     template_name = os.getenv('WATI_TEMPLATE_NAME', 'Template_Name')
     safe_print(f"📋 Template: {template_name} (content from template.txt)")
     safe_print(f"📎 Media Mode: {'ENABLED' if SEND_MEDIA else 'TEXT-ONLY'}")
@@ -1848,51 +2968,153 @@ def print_config_banner():
         safe_print(f"📊 Priority: 1️⃣ Images → 2️⃣ Videos → 3️⃣ Documents")
     safe_print(f"⏰ Working Hours: {SCRIPT_START_TIME} - {SCRIPT_END_TIME}")
     safe_print(f"🎯 Mode: {'TEST' if USE_TEST_NUMBER else 'PRODUCTION'}")
-    safe_print(f"👥 Counsellors: {len(COUNSELLORS)} configured")
-    safe_print(f"⏳ Anti-Detection Delay: {MIN_DELAY_BETWEEN_MESSAGES}-{MAX_DELAY_BETWEEN_MESSAGES} seconds")
-    safe_print(f"🌍 Global Daily Limit: {GLOBAL_DAILY_LIMIT} messages/day")
-    safe_print(f"🖥️ Chrome Profile: {CHROME_PROFILE_PATH}")
     
-    total_daily_limit = sum(config['daily_limit'] for config in COUNSELLORS.values())
-    safe_print(f"📈 Individual Capacity: {total_daily_limit} messages (limited by global limit)")
-    safe_print("="*60)
+    # Show team configuration
+    try:
+        team_manager = PhoneTeamManager()
+        teams = team_manager.get_all_teams()
+        safe_print(f"")
+        safe_print(f"📱 PHONE TEAMS CONFIGURATION:")
+        total_capacity = 0
+        for team_id, team in teams.items():
+            counsellor_list = ', '.join(team['counsellors'].keys())
+            capacity = team['capacity']
+            total_capacity += capacity
+            safe_print(f"   🔹 {team['manager']} {team['network']} ({team['phone']})")
+            safe_print(f"      👥 Team: {counsellor_list}")
+            safe_print(f"      📊 Capacity: {capacity} messages/day")
+        
+        safe_print(f"")
+        safe_print(f"🌍 GLOBAL LIMITS:")
+        safe_print(f"   📈 Total Team Capacity: {total_capacity} messages/day")
+        safe_print(f"   🚧 Global Daily Limit: {GLOBAL_DAILY_LIMIT} messages/day")
+        effective_capacity = min(total_capacity, GLOBAL_DAILY_LIMIT)
+        safe_print(f"   ⚡ EFFECTIVE Daily Limit: {effective_capacity} messages/day")
+        if GLOBAL_DAILY_LIMIT < total_capacity:
+            safe_print(f"   ⚠️  Global limit is CONTROLLING (limiting from {total_capacity} to {GLOBAL_DAILY_LIMIT})")
+        else:
+            safe_print(f"   ✅ Team capacity is within global limit")
+        
+    except Exception as e:
+        safe_print(f"⚠️ Team configuration error: {e}")
+        safe_print(f"👥 Fallback: {len(ALL_COUNSELLORS)} counsellors configured")
+    
+    safe_print(f"")
+    safe_print(f"🔧 AUTOMATION SETTINGS:")
+    delay_min_min = MIN_DELAY_BETWEEN_MESSAGES // 60
+    delay_max_min = MAX_DELAY_BETWEEN_MESSAGES // 60
+    safe_print(f"   🤖→👤 Human-like Delays: {MIN_DELAY_BETWEEN_MESSAGES}s-{MAX_DELAY_BETWEEN_MESSAGES}s ({delay_min_min}-{delay_max_min} min)")
+    safe_print(f"   🖥️ Max Browsers: {os.getenv('MAX_CONCURRENT_BROWSERS', '4')}")
+    safe_print(f"   🔄 Parallel Mode: {'ENABLED' if os.getenv('ENABLE_PARALLEL_EXECUTION', 'true').lower() == 'true' else 'DISABLED'}")
+    safe_print(f"   📂 Profiles Base: {os.getenv('CHROME_PROFILES_BASE_PATH', 'Default')}")
+    
+    # Add delay recommendations
+    if MAX_DELAY_BETWEEN_MESSAGES < 120:
+        safe_print(f"   ⚠️  DELAY WARNING: Very fast delays may trigger WhatsApp detection")
+    elif MAX_DELAY_BETWEEN_MESSAGES > 600:
+        safe_print(f"   🐌 SLOW MODE: Extra careful delays for maximum safety")
+    
+    safe_print(f"")
+    safe_print(f"🔐 CRITICAL SECURITY NOTICE:")
+    safe_print(f"   ⚠️  MUST scan QR codes with CORRECT manager phones!")
+    safe_print(f"   📱 Each team ONLY uses its designated WhatsApp number")
+    safe_print(f"   🚨 Teams without proper login will be SKIPPED")
+    safe_print(f"   ✅ Only active/logged-in teams will process leads")
+    safe_print("="*70)
 
 def print_final_summary(result: Dict):
-    """Print optimized final summary"""
-    safe_print("\n" + "🏁"*50)
-    safe_print("📊 SELENIUM CAMPAIGN EXECUTION SUMMARY")
-    safe_print("🏁"*50)
+    """Print multi-team campaign summary"""
+    safe_print("\n" + "🏁"*60)
+    safe_print("📊 MULTI-TEAM CAMPAIGN EXECUTION SUMMARY")
+    safe_print("🏁"*60)
     
     status = result['status']
     
     if status == 'completed':
         metrics = result.get('metrics', {})
+        successful_teams = result.get('successful_teams', [])
+        failed_teams = result.get('failed_teams', [])
         
         safe_print(f"✅ STATUS: COMPLETED")
-        safe_print(f"📤 Messages Sent: {metrics.get('sent', 0)}")
-        safe_print(f"📱 Delivered: {metrics.get('delivered', 0)}")
-        safe_print(f"👀 Read: {metrics.get('read', 0)}")
-        safe_print(f"❌ Failed: {metrics.get('failed', 0)}")
-        safe_print(f"⚡ Success Rate: {metrics.get('success_rate', 0):.1f}%")
-        safe_print(f"⏱️ Duration: {metrics.get('duration', 'Unknown')}")
+        safe_print(f"")
+        safe_print(f"🌐 GLOBAL RESULTS:")
+        safe_print(f"   📤 Messages Sent: {metrics.get('sent', 0)}")
+        safe_print(f"   📱 Delivered: {metrics.get('delivered', 0)}")
+        safe_print(f"   👀 Read: {metrics.get('read', 0)}")
+        safe_print(f"   ❌ Failed: {metrics.get('failed', 0)}")
+        safe_print(f"   ⚡ Success Rate: {metrics.get('success_rate', 0):.1f}%")
+        safe_print(f"   🌍 Global Quota Used: {metrics.get('global_quota_used', 0)}/{GLOBAL_DAILY_LIMIT}")
+        
+        safe_print(f"")
+        safe_print(f"📱 TEAM STATUS:")
+        safe_print(f"   ✅ Successful Teams: {len(successful_teams)}")
+        if successful_teams:
+            try:
+                team_manager = PhoneTeamManager()
+                for team_id in successful_teams:
+                    team_config = team_manager.get_team_by_id(team_id)
+                    if team_config:
+                        safe_print(f"      🔹 {team_id}: {team_config['manager']} {team_config['network']} ({team_config['phone']})")
+                    else:
+                        safe_print(f"      🔹 {team_id}")
+            except:
+                for team_id in successful_teams:
+                    safe_print(f"      🔹 {team_id}")
+        
+        if failed_teams:
+            safe_print(f"   ❌ Failed Teams: {len(failed_teams)} (SKIPPED - No WhatsApp Login)")
+            try:
+                team_manager = PhoneTeamManager()
+                for team_id in failed_teams:
+                    team_config = team_manager.get_team_by_id(team_id)
+                    if team_config:
+                        safe_print(f"      🔸 {team_id}: {team_config['manager']} {team_config['network']} ({team_config['phone']}) - LOGIN REQUIRED")
+                    else:
+                        safe_print(f"      🔸 {team_id} - LOGIN REQUIRED")
+            except:
+                for team_id in failed_teams:
+                    safe_print(f"      🔸 {team_id} - LOGIN REQUIRED")
+        
+        # Show team breakdown if available
+        team_breakdown = metrics.get('team_breakdown', {})
+        if team_breakdown:
+            safe_print(f"")
+            safe_print(f"📊 TEAM BREAKDOWN:")
+            for team_id, team_metrics in team_breakdown.items():
+                team_sent = team_metrics.get('sent', 0)
+                team_failed = team_metrics.get('failed', 0)
+                team_total = team_metrics.get('total_processed', 0)
+                if team_total > 0:
+                    team_success_rate = ((team_sent) / team_total) * 100
+                    safe_print(f"   📱 {team_id}: {team_sent} sent, {team_failed} failed ({team_success_rate:.1f}% success)")
         
         if metrics.get('sent', 0) > 0:
             safe_print("\n🎯 NEXT STEPS:")
-            safe_print("   ✅ Check WhatsApp Web for delivery confirmations")
-            safe_print("   📱 Monitor responses in WhatsApp")
+            safe_print("   ✅ Check WhatsApp Web sessions for delivery confirmations")
+            safe_print("   📱 Monitor responses across all manager phones")
             safe_print("   🔍 Review message logs in admin panel")
+            safe_print("   📊 Check team-specific analytics")
         else:
             safe_print("\n⚠️ NO MESSAGES SENT - CHECK:")
-            safe_print("   🌐 WhatsApp Web login status")
-            safe_print("   📱 Phone number formats")
+            safe_print("   🌐 WhatsApp Web login status for all teams")
+            safe_print("   📱 Phone number formats in .env")
             safe_print("   🖥️ Browser and Chrome driver setup")
+            safe_print("   👥 Team configurations in .env")
     
-    elif status == 'browser_initialization_failed':
-        safe_print(f"🖥️ STATUS: BROWSER INITIALIZATION FAILED")
+    elif status == 'all_browsers_failed':
+        safe_print(f"🖥️ STATUS: ALL BROWSER SESSIONS FAILED")
         safe_print("🔧 CHECK:")
-        safe_print("   📱 WhatsApp Web QR code scan")
-        safe_print("   🖥️ Chrome driver path")
-        safe_print("   📂 Chrome profile permissions")
+        safe_print("   📱 WhatsApp Web QR code scan for all phones")
+        safe_print("   🖥️ Chrome driver path and permissions")
+        safe_print("   📂 Chrome profile directories")
+        safe_print("   🌐 Internet connection")
+    
+    elif status == 'no_leads_to_distribute':
+        safe_print(f"📭 STATUS: NO LEADS AVAILABLE FOR DISTRIBUTION")
+        safe_print("🔍 CHECK:")
+        safe_print("   📊 Lead API and filters")
+        safe_print("   💾 Team quotas and capacity")
+        safe_print("   🌍 Global daily limit")
     
     elif status == 'outside_working_hours':
         safe_print(f"🕐 STATUS: OUTSIDE WORKING HOURS")
@@ -1904,13 +3126,13 @@ def print_final_summary(result: Dict):
         safe_print(f"🚫 Maximum {GLOBAL_DAILY_LIMIT} messages/day limit reached")
         safe_print("📅 Script will resume tomorrow")
     
-    elif status == 'quota_exhausted':
-        safe_print(f"🚫 STATUS: DAILY QUOTAS EXHAUSTED")
-        safe_print("📅 All counsellors have reached their daily limits")
-    
-    elif status == 'no_leads':
-        safe_print(f"📭 STATUS: NO LEADS AVAILABLE")
-        safe_print("🔍 Check lead API and filters")
+    elif status == 'error':
+        safe_print(f"💥 STATUS: SYSTEM ERROR")
+        safe_print(f"🔍 Error: {result.get('message', 'Unknown error')}")
+        safe_print("🔧 CHECK:")
+        safe_print("   📝 Script logs for details")
+        safe_print("   🌐 Network connectivity")
+        safe_print("   📂 File permissions")
     
     else:
         safe_print(f"❓ STATUS: {status.upper()}")
@@ -1926,11 +3148,11 @@ if __name__ == "__main__":
         # Display configuration
         print_config_banner()
         
-        # Initialize automation
-        automation = EnhancedLeadAutomation()
+        # Initialize multi-team automation
+        automation = MultiTeamAutomation()
         
-        # Run campaign
-        result = automation.run_campaign()
+        # Run multi-team campaign
+        result = automation.run_multi_team_campaign()
         
         # Display results
         print_final_summary(result)

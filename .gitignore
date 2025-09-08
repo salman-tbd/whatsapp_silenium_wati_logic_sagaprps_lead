@@ -1,1 +1,32 @@
+# Environment and sensitive configuration
 .env
+
+# Build artifacts  
+build/
+dist/
+*.exe
+*.spec
+__pycache__/
+*.pyc
+*.pyo
+
+# Runtime data files (keep structure, exclude data)
+# Note: JSON files are included as empty templates
+
+# Logs
+*.log
+selenium_whatsapp_automation.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temporary files
+*.tmp
+*.temp
