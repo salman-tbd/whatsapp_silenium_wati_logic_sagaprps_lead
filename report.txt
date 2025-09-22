@@ -1,0 +1,58 @@
+📊 *WhatsApp Automation Daily Report*
+📅 Date: {{DATE}}
+⏰ Time: {{TIME}}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📈 *CAMPAIGN SUMMARY*
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🎯 *Overall Performance:*
+• Total Messages Sent: {{TOTAL_MESSAGES}} 
+• Success Rate: {{SUCCESS_RATE}}%
+• Campaign Duration: {{DURATION}}
+• Global Quota Used: {{GLOBAL_USED}}/{{GLOBAL_LIMIT}}
+
+📱 *Team Performance:*
+{{TEAM_BREAKDOWN}}
+
+📊 *Team Quota Usage:*
+{{TEAM_QUOTA_BREAKDOWN}}
+
+👥 *Counselor Statistics:*
+{{COUNSELOR_STATS}}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔄 *SYSTEM STATUS*
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ *Active Teams:* {{ACTIVE_TEAMS}}
+❌ *Failed Teams:* {{FAILED_TEAMS}}
+
+{{FAILOVER_SECTION}}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📊 *DETAILED ANALYTICS*
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📤 Messages Sent: {{SENT_COUNT}}
+📱 Delivered: {{DELIVERED_COUNT}}
+👀 Read: {{READ_COUNT}}
+❌ Failed: {{FAILED_COUNT}}
+
+🏆 *Top Performing Team:* {{TOP_TEAM}}
+📈 *Best Success Rate:* {{BEST_SUCCESS_RATE}}%
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+💼 *BUSINESS INSIGHTS*
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🎯 *Today's Reach:* {{TOTAL_MESSAGES}} potential customers
+💰 *Estimated Lead Value:* {{ESTIMATED_VALUE}}
+📈 *Weekly Progress:* {{WEEKLY_PROGRESS}}
+
+🔔 *Next Campaign:* {{NEXT_CAMPAIGN_TIME}}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🤖 *Automated Report by WhatsApp Lead Automation System*
+🏢 *Migrate Zone - Australia Immigration Services*
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
