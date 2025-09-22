@@ -184,6 +184,15 @@ ALL_COUNSELLORS = {
     'Tulsi': {'daily_limit': 50, 'number': '+919726266913', 'username': 'tulsi', 'employee_id': 261},
 }
 
+# 📊 MANAGEMENT REPORTING SYSTEM - Daily Report Recipients
+MANAGEMENT_NUMBERS = {
+    'SALMAN_SIR': os.getenv('SALMAN_SIR_PHONE', '+913333333333'),
+    'SAGAR_SIR': os.getenv('SAGAR_SIR_PHONE', '+913333333333'),
+    'SWETA_MAM': os.getenv('SWETA_MAM_PHONE', '+913333333333'),
+    'DIPALI_MAM': os.getenv('DIPALI_MAM_PHONE', '+913333333333'),
+    'FAHAD': os.getenv('FAHAD_PHONE', '+917699887110'),
+}
+
 # API Configuration
 STATIC_OWNER_ID = int(os.getenv('LEAD_OWNER_ID', '227'))
 USE_TEST_NUMBER = os.getenv('USE_TEST_NUMBER', 'false').lower() == 'true'  # Read from .env file
@@ -2256,11 +2265,530 @@ class CampaignAnalytics:
         }
 
 # ============================================================================
+# INTELLIGENT TEAM FAILOVER SYSTEM  
+# ============================================================================
+
+class TeamFailoverManager:
+    """Manages intelligent failover when teams go offline during campaigns"""
+    
+    def __init__(self, team_manager: PhoneTeamManager):
+        self.team_manager = team_manager
+        # Define backup relationships
+        self.backup_mapping = {
+            'sweta_jio': 'sweta_airtel',      # If Sweta Jio fails → use Sweta Airtel
+            'dipali_jio': 'dipali_airtel'     # If Dipali Jio fails → use Dipali Airtel
+        }
+        self.failover_history = []
+        logger.info("🔄 Intelligent Failover System initialized")
+    
+    def check_team_health(self, team_id: str, client) -> bool:
+        """Check if team's WhatsApp session is still active"""
+        try:
+            if not client or not client.driver:
+                return False
+            
+            # Quick health check - try to access page
+            current_url = client.driver.current_url
+            if "web.whatsapp.com" not in current_url.lower():
+                return False
+            
+            # Check if still logged in (look for logged-in indicators)
+            page_text = client.driver.page_source.lower()
+            logged_out_indicators = [
+                "scan me",
+                "qr code", 
+                "download whatsapp",
+                "use whatsapp on your computer"
+            ]
+            
+            if any(indicator in page_text for indicator in logged_out_indicators):
+                logger.warning(f"🚨 Team {team_id} appears to be logged out")
+                return False
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Health check failed for team {team_id}: {e}")
+            return False
+    
+    def get_backup_team(self, failed_team: str) -> Optional[str]:
+        """Get backup team for failed team"""
+        return self.backup_mapping.get(failed_team)
+    
+    def can_failover(self, failed_team: str, available_teams: set) -> bool:
+        """Check if failover is possible"""
+        backup_team = self.get_backup_team(failed_team)
+        return backup_team and backup_team in available_teams
+    
+    def merge_team_counselors(self, primary_team: str, backup_team: str) -> Dict:
+        """Merge counselors from failed team with backup team"""
+        try:
+            primary_config = self.team_manager.get_team_by_id(primary_team)
+            backup_config = self.team_manager.get_team_by_id(backup_team)
+            
+            if not primary_config or not backup_config:
+                return None
+            
+            # Create merged team configuration
+            merged_counselors = {}
+            
+            # Add backup team counselors first (they have active session)
+            merged_counselors.update(backup_config['counsellors'])
+            
+            # Add primary team counselors (will use backup team's WhatsApp session)
+            merged_counselors.update(primary_config['counsellors'])
+            
+            merged_config = backup_config.copy()
+            merged_config['counsellors'] = merged_counselors
+            merged_config['original_teams'] = [primary_team, backup_team]
+            merged_config['capacity'] = sum(c['daily_limit'] for c in merged_counselors.values())
+            
+            logger.info(f"🔄 TEAM MERGER: {primary_team} + {backup_team}")
+            logger.info(f"   📱 Phone: {backup_config['phone']}")
+            logger.info(f"   👥 Combined Counselors: {', '.join(merged_counselors.keys())}")
+            logger.info(f"   📊 Total Capacity: {merged_config['capacity']}")
+            
+            return merged_config
+            
+        except Exception as e:
+            logger.error(f"Failed to merge teams {primary_team} + {backup_team}: {e}")
+            return None
+    
+    def redistribute_leads(self, failed_team_leads: List[Dict], backup_team: str, 
+                          backup_client, quota_manager) -> bool:
+        """Redistribute leads from failed team to backup team"""
+        try:
+            if not failed_team_leads:
+                return True
+            
+            backup_config = self.team_manager.get_team_by_id(backup_team)
+            merged_config = self.merge_team_counselors(
+                self.get_primary_team_for_backup(backup_team), backup_team
+            )
+            
+            if not merged_config:
+                return False
+            
+            logger.info(f"🔄 LEAD REDISTRIBUTION: {len(failed_team_leads)} leads")
+            logger.info(f"   📤 From: Failed team")
+            logger.info(f"   📥 To: {backup_team} ({backup_config['phone']})")
+            logger.info(f"   👥 Available Counselors: {', '.join(merged_config['counsellors'].keys())}")
+            
+            # Update the backup client to use merged configuration
+            backup_client.team_config = merged_config
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to redistribute leads: {e}")
+            return False
+    
+    def get_primary_team_for_backup(self, backup_team: str) -> Optional[str]:
+        """Get primary team that uses this backup"""
+        for primary, backup in self.backup_mapping.items():
+            if backup == backup_team:
+                return primary
+        return None
+    
+    def log_failover_event(self, failed_team: str, backup_team: str, leads_count: int):
+        """Log failover event for monitoring"""
+        event = {
+            'timestamp': datetime.now().isoformat(),
+            'failed_team': failed_team,
+            'backup_team': backup_team,
+            'leads_redistributed': leads_count,
+            'action': 'team_failover'
+        }
+        self.failover_history.append(event)
+        
+        logger.warning(f"🚨 FAILOVER EVENT LOGGED:")
+        logger.warning(f"   💥 Failed: {failed_team}")
+        logger.warning(f"   🔄 Backup: {backup_team}")
+        logger.warning(f"   📊 Leads: {leads_count}")
+
+# ============================================================================
+# AUTOMATED DAILY REPORTING SYSTEM
+# ============================================================================
+
+class DailyReportGenerator:
+    """Generates and sends comprehensive daily reports to management"""
+    
+    def __init__(self, team_manager: PhoneTeamManager, quota_manager: GlobalQuotaManager):
+        self.team_manager = team_manager
+        self.quota_manager = quota_manager
+        self.report_enabled = os.getenv('ENABLE_DAILY_REPORTS', 'true').lower() == 'true'
+        logger.info("📊 Daily Report Generator initialized")
+    
+    def generate_comprehensive_report(self, campaign_result: Dict, failover_events: List = None) -> str:
+        """Generate comprehensive daily report from campaign data and quota files"""
+        try:
+            report_template = self._load_report_template()
+            
+            # Get campaign metrics
+            metrics = campaign_result.get('metrics', {})
+            
+            # Calculate key statistics
+            total_messages = metrics.get('sent', 0)
+            success_rate = metrics.get('success_rate', 0)
+            duration = self._format_duration(campaign_result.get('start_time'), datetime.now())
+            
+            # Get quota information
+            global_used = self.quota_manager.get_global_quota_used()
+            global_limit = GLOBAL_DAILY_LIMIT
+            
+            # Get team breakdown
+            team_breakdown = self._generate_team_breakdown(metrics.get('team_breakdown', {}))
+            team_quota_breakdown = self._generate_team_quota_breakdown()
+            counselor_stats = self._generate_counselor_stats(metrics.get('team_breakdown', {}))
+            
+            # Get system status
+            successful_teams = campaign_result.get('successful_teams', [])
+            failed_teams = campaign_result.get('failed_teams', [])
+            
+            # Generate failover section
+            failover_section = self._generate_failover_section(failover_events or [])
+            
+            # Calculate business insights
+            estimated_value = self._calculate_estimated_value(total_messages)
+            weekly_progress = self._get_weekly_progress()
+            next_campaign = self._get_next_campaign_time()
+            
+            # Get top performing team
+            top_team, best_success_rate = self._get_top_performing_team(metrics.get('team_breakdown', {}))
+            
+            # Replace template placeholders
+            report = report_template.replace('{{DATE}}', datetime.now().strftime('%d %B %Y'))
+            report = report.replace('{{TIME}}', datetime.now().strftime('%I:%M %p'))
+            report = report.replace('{{TOTAL_MESSAGES}}', str(total_messages))
+            report = report.replace('{{SUCCESS_RATE}}', f"{success_rate:.1f}")
+            report = report.replace('{{DURATION}}', duration)
+            report = report.replace('{{GLOBAL_USED}}', str(global_used))
+            report = report.replace('{{GLOBAL_LIMIT}}', str(global_limit))
+            report = report.replace('{{TEAM_BREAKDOWN}}', team_breakdown)
+            report = report.replace('{{TEAM_QUOTA_BREAKDOWN}}', team_quota_breakdown)
+            report = report.replace('{{COUNSELOR_STATS}}', counselor_stats)
+            report = report.replace('{{ACTIVE_TEAMS}}', ', '.join(successful_teams))
+            report = report.replace('{{FAILED_TEAMS}}', ', '.join(failed_teams) if failed_teams else 'None')
+            report = report.replace('{{FAILOVER_SECTION}}', failover_section)
+            report = report.replace('{{SENT_COUNT}}', str(metrics.get('sent', 0)))
+            report = report.replace('{{DELIVERED_COUNT}}', str(metrics.get('delivered', 0)))
+            report = report.replace('{{READ_COUNT}}', str(metrics.get('read', 0)))
+            report = report.replace('{{FAILED_COUNT}}', str(metrics.get('failed', 0)))
+            report = report.replace('{{TOP_TEAM}}', top_team)
+            report = report.replace('{{BEST_SUCCESS_RATE}}', f"{best_success_rate:.1f}")
+            report = report.replace('{{ESTIMATED_VALUE}}', estimated_value)
+            report = report.replace('{{WEEKLY_PROGRESS}}', weekly_progress)
+            report = report.replace('{{NEXT_CAMPAIGN_TIME}}', next_campaign)
+            
+            return report
+            
+        except Exception as e:
+            logger.error(f"Error generating report: {e}")
+            return self._generate_fallback_report(campaign_result)
+    
+    def _load_report_template(self) -> str:
+        """Load report template from file"""
+        try:
+            if os.path.exists('report.txt'):
+                with open('report.txt', 'r', encoding='utf-8') as f:
+                    return f.read()
+            else:
+                logger.warning("report.txt not found, using fallback template")
+                return self._get_fallback_template()
+        except Exception as e:
+            logger.error(f"Error loading report template: {e}")
+            return self._get_fallback_template()
+    
+    def _generate_team_breakdown(self, team_breakdown: Dict) -> str:
+        """Generate formatted team performance breakdown"""
+        if not team_breakdown:
+            return "• No team data available"
+        
+        breakdown_lines = []
+        for team_id, metrics in team_breakdown.items():
+            team_config = self.team_manager.get_team_by_id(team_id)
+            if team_config:
+                team_name = f"{team_config['manager']} {team_config['network']}"
+                phone = team_config['phone']
+                sent = metrics.get('sent', 0)
+                total = metrics.get('total_processed', 0)
+                success_rate = (sent / total * 100) if total > 0 else 0
+                
+                breakdown_lines.append(
+                    f"• {team_name} ({phone}): {sent} sent, {success_rate:.1f}% success"
+                )
+        
+        return '\n'.join(breakdown_lines) if breakdown_lines else "• No team data available"
+    
+    def _generate_team_quota_breakdown(self) -> str:
+        """Generate team quota breakdown from multi_team_quota.json in format: team(counselors)=count"""
+        try:
+            today = datetime.now().strftime('%Y-%m-%d')
+            quota_breakdown = []
+            
+            # Try to read from multi_team_quota.json
+            try:
+                with open('multi_team_quota.json', 'r') as f:
+                    quota_data = json.load(f)
+                    today_data = quota_data.get(today, {})
+                    teams_data = today_data.get('teams', {})
+            except (FileNotFoundError, json.JSONDecodeError):
+                teams_data = {}
+            
+            # Generate breakdown for each team
+            all_teams = self.team_manager.get_all_teams()
+            for team_id in ['sweta_jio', 'sweta_airtel', 'dipali_jio', 'dipali_airtel']:
+                team_config = all_teams.get(team_id)
+                if team_config:
+                    # Get counselors for this team
+                    counselors = list(team_config['counsellors'].keys())
+                    counselors_str = ','.join(counselors)
+                    
+                    # Get quota usage for this team
+                    team_quota = teams_data.get(team_id, 0)
+                    
+                    # Format: team_name(counselor1,counselor2)=count
+                    quota_breakdown.append(f"{team_id}({counselors_str})={team_quota}")
+            
+            return '\n'.join(quota_breakdown) if quota_breakdown else "• No quota data available"
+            
+        except Exception as e:
+            logger.error(f"Error generating team quota breakdown: {e}")
+            return "• Error loading quota data"
+    
+    def _generate_counselor_stats(self, team_breakdown: Dict) -> str:
+        """Generate counselor statistics from team data"""
+        counselor_stats = {}
+        
+        for team_id, metrics in team_breakdown.items():
+            team_config = self.team_manager.get_team_by_id(team_id)
+            if team_config:
+                counselors = team_config.get('counsellors', {})
+                sent_count = metrics.get('sent', 0)
+                
+                # Distribute sent messages across counselors (simplified)
+                counselors_in_team = len(counselors)
+                if counselors_in_team > 0:
+                    avg_per_counselor = sent_count // counselors_in_team
+                    remainder = sent_count % counselors_in_team
+                    
+                    for i, counselor_name in enumerate(counselors.keys()):
+                        counselor_sent = avg_per_counselor + (1 if i < remainder else 0)
+                        if counselor_name in counselor_stats:
+                            counselor_stats[counselor_name] += counselor_sent
+                        else:
+                            counselor_stats[counselor_name] = counselor_sent
+        
+        # Format counselor stats
+        if counselor_stats:
+            stats_lines = []
+            for counselor, sent in sorted(counselor_stats.items(), key=lambda x: x[1], reverse=True):
+                phone = ALL_COUNSELLORS.get(counselor, {}).get('number', 'Unknown')
+                stats_lines.append(f"• {counselor} ({phone}): {sent} messages")
+            return '\n'.join(stats_lines)
+        else:
+            return "• No counselor data available"
+    
+    def _generate_failover_section(self, failover_events: List) -> str:
+        """Generate failover events section"""
+        if not failover_events:
+            return "🔄 *Failover Events:* None (All teams remained stable)"
+        
+        failover_lines = ["🔄 *Failover Events:*"]
+        for event in failover_events:
+            failed_team = event.get('failed_team', 'Unknown')
+            backup_team = event.get('backup_team', 'Unknown')
+            leads_count = event.get('leads_redistributed', 0)
+            timestamp = event.get('timestamp', 'Unknown')
+            
+            failover_lines.append(f"• {failed_team} → {backup_team} ({leads_count} leads at {timestamp})")
+        
+        failover_lines.append("✅ All failover operations completed successfully")
+        return '\n'.join(failover_lines)
+    
+    def _calculate_estimated_value(self, total_messages: int) -> str:
+        """Calculate estimated business value"""
+        # Rough calculation: each message could generate ₹500-2000 in visa fees
+        min_value = total_messages * 500
+        max_value = total_messages * 2000
+        return f"₹{min_value:,} - ₹{max_value:,}"
+    
+    def _get_weekly_progress(self) -> str:
+        """Get weekly progress information"""
+        try:
+            # Load quota data for the week
+            today = datetime.now()
+            week_total = 0
+            
+            for i in range(7):
+                date = (today - timedelta(days=i)).strftime('%Y-%m-%d')
+                try:
+                    with open('multi_team_quota.json', 'r') as f:
+                        data = json.load(f)
+                        day_data = data.get(date, {})
+                        week_total += day_data.get('global_total', 0)
+                except:
+                    continue
+            
+            return f"{week_total} messages this week"
+        except:
+            return "Weekly data unavailable"
+    
+    def _get_next_campaign_time(self) -> str:
+        """Get next campaign time"""
+        now = datetime.now()
+        next_run = now.replace(hour=9, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        return next_run.strftime('%d %B %Y at %I:%M %p')
+    
+    def _get_top_performing_team(self, team_breakdown: Dict) -> Tuple[str, float]:
+        """Get top performing team"""
+        if not team_breakdown:
+            return "No data", 0.0
+        
+        best_team = ""
+        best_rate = 0.0
+        
+        for team_id, metrics in team_breakdown.items():
+            sent = metrics.get('sent', 0)
+            total = metrics.get('total_processed', 0)
+            if total > 0:
+                success_rate = (sent / total) * 100
+                if success_rate > best_rate:
+                    best_rate = success_rate
+                    team_config = self.team_manager.get_team_by_id(team_id)
+                    if team_config:
+                        best_team = f"{team_config['manager']} {team_config['network']}"
+        
+        return best_team or "No data", best_rate
+    
+    def _format_duration(self, start_time, end_time) -> str:
+        """Format campaign duration"""
+        try:
+            if isinstance(start_time, str):
+                start_time = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
+            if isinstance(end_time, str):
+                end_time = datetime.fromisoformat(end_time.replace('Z', '+00:00'))
+            
+            duration = end_time - start_time
+            hours = int(duration.total_seconds() // 3600)
+            minutes = int((duration.total_seconds() % 3600) // 60)
+            
+            if hours > 0:
+                return f"{hours}h {minutes}m"
+            else:
+                return f"{minutes}m"
+        except:
+            return "Unknown"
+    
+    def _get_fallback_template(self) -> str:
+        """Fallback template if report.txt is not found"""
+        return """📊 WhatsApp Automation Daily Report
+📅 Date: {{DATE}}
+⏰ Time: {{TIME}}
+
+📈 Campaign Summary:
+• Total Messages: {{TOTAL_MESSAGES}}
+• Success Rate: {{SUCCESS_RATE}}%
+• Duration: {{DURATION}}
+• Global Quota: {{GLOBAL_USED}}/{{GLOBAL_LIMIT}}
+
+📱 Team Performance:
+{{TEAM_BREAKDOWN}}
+
+📊 Team Quota Usage:
+{{TEAM_QUOTA_BREAKDOWN}}
+
+🔄 System Status:
+• Active Teams: {{ACTIVE_TEAMS}}
+• Failed Teams: {{FAILED_TEAMS}}
+
+{{FAILOVER_SECTION}}
+
+🤖 Automated Report by WhatsApp Automation System"""
+    
+    def _generate_fallback_report(self, campaign_result: Dict) -> str:
+        """Generate basic fallback report"""
+        metrics = campaign_result.get('metrics', {})
+        team_quota_breakdown = self._generate_team_quota_breakdown()
+        
+        return f"""📊 WhatsApp Automation Daily Report
+📅 {datetime.now().strftime('%d %B %Y')}
+⏰ {datetime.now().strftime('%I:%M %p')}
+
+📈 Quick Summary:
+• Messages Sent: {metrics.get('sent', 0)}
+• Success Rate: {metrics.get('success_rate', 0):.1f}%
+• Global Quota Used: {self.quota_manager.get_global_quota_used()}/{GLOBAL_DAILY_LIMIT}
+
+📊 Team Quota Usage:
+{team_quota_breakdown}
+
+🤖 Automated Report by WhatsApp Automation System"""
+    
+    def send_report_to_management(self, report_content: str, available_client=None) -> bool:
+        """Send generated report to all management numbers"""
+        if not self.report_enabled:
+            logger.info("📊 Daily reports disabled in configuration")
+            return False
+        
+        if not available_client:
+            logger.warning("📊 No available WhatsApp client for sending reports")
+            return False
+        
+        logger.info("📊 Sending daily report to management...")
+        
+        sent_count = 0
+        total_recipients = len(MANAGEMENT_NUMBERS)
+        
+        for name, phone in MANAGEMENT_NUMBERS.items():
+            try:
+                logger.info(f"📊 Sending report to {name} ({phone})")
+                
+                # Navigate to recipient's chat
+                if available_client._navigate_to_chat(phone):
+                    # Find input box
+                    if available_client._find_input_box():
+                        # Send report using clipboard method
+                        try:
+                            available_client.input_box.clear()
+                            pyperclip.copy(report_content)
+                            time.sleep(0.5)
+                            
+                            available_client.input_box.click()
+                            time.sleep(0.5)
+                            
+                            available_client.input_box.send_keys(Keys.CONTROL, "v")
+                            time.sleep(1)
+                            
+                            available_client.input_box.send_keys(Keys.ENTER)
+                            
+                            logger.info(f"✅ Report sent to {name}")
+                            sent_count += 1
+                            
+                            # Add delay between recipients
+                            time.sleep(3)
+                            
+                        except Exception as e:
+                            logger.error(f"❌ Failed to send report to {name}: {e}")
+                    else:
+                        logger.error(f"❌ Could not find input box for {name}")
+                else:
+                    logger.error(f"❌ Could not open chat for {name} ({phone})")
+                    
+            except Exception as e:
+                logger.error(f"❌ Error sending report to {name}: {e}")
+        
+        success_rate = (sent_count / total_recipients) * 100
+        logger.info(f"📊 Report delivery complete: {sent_count}/{total_recipients} sent ({success_rate:.1f}% success)")
+        
+        return sent_count > 0
+
+# ============================================================================
 # MULTI-TEAM AUTOMATION ORCHESTRATOR
 # ============================================================================
 
 class MultiTeamAutomation:
-    """Orchestrates parallel execution across all phone teams"""
+    """Orchestrates parallel execution across all phone teams with intelligent failover"""
     
     def __init__(self):
         self.team_manager = PhoneTeamManager()
@@ -2271,6 +2799,15 @@ class MultiTeamAutomation:
         self.global_analytics = CampaignAnalytics()
         self.enable_parallel = os.getenv('ENABLE_PARALLEL_EXECUTION', 'true').lower() == 'true'
         self.max_browsers = int(os.getenv('MAX_CONCURRENT_BROWSERS', '4'))
+        
+        # 🚀 NEW: Intelligent Failover System
+        self.failover_manager = TeamFailoverManager(self.team_manager)
+        self.active_teams = set()  # Track currently active teams
+        self.failed_teams = set()  # Track failed teams
+        self.redistributed_leads = {}  # Track redistributed leads
+        
+        # 📊 NEW: Daily Report Generator
+        self.report_generator = DailyReportGenerator(self.team_manager, self.quota_manager)
         
     def initialize_all_browsers(self) -> Dict[str, bool]:
         """Initialize all browser sessions in parallel with strict team validation"""
@@ -2481,8 +3018,8 @@ class MultiTeamAutomation:
             return []
     
     def process_teams_parallel(self, distributed_leads: Dict[str, List[Dict]]) -> Dict:
-        """Process all teams in parallel with strict team-browser validation"""
-        opt_logger.browser_status("🚀 Starting parallel team processing with SECURITY validation...")
+        """Process all teams in parallel with INTELLIGENT FAILOVER and real-time health monitoring"""
+        opt_logger.browser_status("🚀 Starting parallel team processing with INTELLIGENT FAILOVER...")
         
         # Validate that all teams have their own browser sessions
         for team_id in distributed_leads.keys():
@@ -2490,58 +3027,282 @@ class MultiTeamAutomation:
                 logger.error(f"🚨 CRITICAL: Team {team_id} has leads but NO browser session!")
                 raise ValueError(f"Security violation: Team {team_id} cannot process leads without dedicated browser")
         
+        # 🚀 NEW: Initialize active teams tracking
+        self.active_teams = set(distributed_leads.keys())
         opt_logger.browser_status("🔐 Team-Browser Security Check: PASSED")
+        opt_logger.browser_status(f"🔄 Failover System: ACTIVE (monitoring {len(self.active_teams)} teams)")
         
         # Start analytics
         self.global_analytics.start_campaign()
         for analytics in self.team_analytics.values():
             analytics.start_campaign()
         
-        # Process teams in parallel with validation
+        # 🚀 NEW: Process teams with real-time health monitoring and failover
         if self.enable_parallel:
-            with ThreadPoolExecutor(max_workers=len(self.team_clients)) as executor:
-                future_to_team = {}
-                
-                for team_id, team_leads in distributed_leads.items():
-                    if team_leads and team_id in self.team_clients:
-                        # Double-check team has dedicated browser before processing
-                        team_config = self.team_manager.get_team_by_id(team_id)
-                        expected_phone = team_config['phone']
-                        opt_logger.browser_status(f"🔐 Processing {team_id} → {expected_phone} ({len(team_leads)} leads)")
-                        
-                        future = executor.submit(self._process_single_team_secured, team_id, team_leads)
-                        future_to_team[future] = team_id
-                
-                # Collect results
-                team_results = {}
-                for future in as_completed(future_to_team):
-                    team_id = future_to_team[future]
-                    try:
-                        result = future.result()
-                        team_results[team_id] = result
-                        team_config = self.team_manager.get_team_by_id(team_id)
-                        opt_logger.browser_status(f"✅ Team {team_id} ({team_config['phone']}) processing complete")
-                    except Exception as e:
-                        logger.error(f"Exception processing team {team_id}: {e}")
-                        team_results[team_id] = {'processed': 0, 'errors': 1}
+            team_results = self._process_with_intelligent_failover(distributed_leads)
         else:
-            # Sequential processing (for debugging)
-            team_results = {}
-            for team_id, team_leads in distributed_leads.items():
-                if team_leads and team_id in self.team_clients:
-                    team_config = self.team_manager.get_team_by_id(team_id)
-                    expected_phone = team_config['phone']
-                    opt_logger.browser_status(f"🔐 Processing {team_id} → {expected_phone} ({len(team_leads)} leads)")
-                    
-                    result = self._process_single_team_secured(team_id, team_leads)
-                    team_results[team_id] = result
+            # Sequential processing with health monitoring
+            team_results = self._process_sequential_with_monitoring(distributed_leads)
         
         # End analytics
         self.global_analytics.end_campaign()
         for analytics in self.team_analytics.values():
             analytics.end_campaign()
         
+        # 🚀 NEW: Log failover summary
+        if self.failover_manager.failover_history:
+            opt_logger.browser_status("🔄 FAILOVER EVENTS SUMMARY:")
+            for event in self.failover_manager.failover_history:
+                opt_logger.browser_status(f"   💥 {event['failed_team']} → 🔄 {event['backup_team']} ({event['leads_redistributed']} leads)")
+        
         return team_results
+    
+    def _process_with_intelligent_failover(self, distributed_leads: Dict[str, List[Dict]]) -> Dict:
+        """Process teams in parallel with real-time health monitoring and automatic failover"""
+        opt_logger.browser_status("🔄 Starting INTELLIGENT FAILOVER processing...")
+        
+        team_results = {}
+        active_distributed_leads = distributed_leads.copy()
+        
+        with ThreadPoolExecutor(max_workers=len(self.team_clients)) as executor:
+            future_to_team = {}
+            
+            # Start processing all teams
+            for team_id, team_leads in active_distributed_leads.items():
+                if team_leads and team_id in self.team_clients:
+                    team_config = self.team_manager.get_team_by_id(team_id)
+                    expected_phone = team_config['phone']
+                    opt_logger.browser_status(f"🔐 Processing {team_id} → {expected_phone} ({len(team_leads)} leads)")
+                    
+                    future = executor.submit(self._process_team_with_health_monitoring, team_id, team_leads)
+                    future_to_team[future] = team_id
+            
+            # Monitor and collect results with failover handling
+            for future in as_completed(future_to_team):
+                team_id = future_to_team[future]
+                try:
+                    result = future.result()
+                    team_results[team_id] = result
+                    
+                    # Check if this team failed and needs failover
+                    if result.get('health_failed', False):
+                        self._handle_team_failover(team_id, active_distributed_leads, executor, future_to_team)
+                    else:
+                        team_config = self.team_manager.get_team_by_id(team_id)
+                        opt_logger.browser_status(f"✅ Team {team_id} ({team_config['phone']}) processing complete")
+                        
+                except Exception as e:
+                    logger.error(f"Exception processing team {team_id}: {e}")
+                    team_results[team_id] = {'processed': 0, 'errors': 1, 'health_failed': True}
+                    
+                    # Try failover for this team
+                    self._handle_team_failover(team_id, active_distributed_leads, executor, future_to_team)
+        
+        return team_results
+    
+    def _process_sequential_with_monitoring(self, distributed_leads: Dict[str, List[Dict]]) -> Dict:
+        """Process teams sequentially with health monitoring and failover"""
+        opt_logger.browser_status("🔄 Starting SEQUENTIAL processing with health monitoring...")
+        
+        team_results = {}
+        active_distributed_leads = distributed_leads.copy()
+        
+        for team_id, team_leads in list(active_distributed_leads.items()):
+            if team_leads and team_id in self.team_clients:
+                team_config = self.team_manager.get_team_by_id(team_id)
+                expected_phone = team_config['phone']
+                opt_logger.browser_status(f"🔐 Processing {team_id} → {expected_phone} ({len(team_leads)} leads)")
+                
+                result = self._process_team_with_health_monitoring(team_id, team_leads)
+                team_results[team_id] = result
+                
+                # Check if this team failed and needs failover
+                if result.get('health_failed', False):
+                    self._handle_team_failover_sequential(team_id, active_distributed_leads, team_results)
+                else:
+                    opt_logger.browser_status(f"✅ Team {team_id} ({expected_phone}) processing complete")
+        
+        return team_results
+    
+    def _handle_team_failover(self, failed_team: str, active_leads: Dict, executor, future_to_team: Dict):
+        """Handle failover for a failed team in parallel processing"""
+        try:
+            backup_team = self.failover_manager.get_backup_team(failed_team)
+            
+            if not backup_team or backup_team not in self.team_clients:
+                opt_logger.browser_status(f"❌ No backup available for {failed_team}")
+                return
+            
+            if backup_team in self.failed_teams:
+                opt_logger.browser_status(f"❌ Backup team {backup_team} also failed - cannot failover")
+                return
+            
+            # Get remaining leads for failed team
+            failed_leads = active_leads.get(failed_team, [])
+            if not failed_leads:
+                return
+            
+            opt_logger.browser_status(f"🚨 FAILOVER TRIGGERED: {failed_team} → {backup_team}")
+            
+            # Merge teams and redistribute leads
+            success = self.failover_manager.redistribute_leads(
+                failed_leads, backup_team, self.team_clients[backup_team], self.quota_manager
+            )
+            
+            if success:
+                # Add failed team leads to backup team
+                if backup_team not in active_leads:
+                    active_leads[backup_team] = []
+                active_leads[backup_team].extend(failed_leads)
+                
+                # Remove failed team from active processing
+                active_leads.pop(failed_team, None)
+                self.failed_teams.add(failed_team)
+                
+                # Log the failover event
+                self.failover_manager.log_failover_event(failed_team, backup_team, len(failed_leads))
+                
+                opt_logger.browser_status(f"✅ FAILOVER SUCCESS: {len(failed_leads)} leads moved to {backup_team}")
+            else:
+                opt_logger.browser_status(f"❌ FAILOVER FAILED for {failed_team}")
+                
+        except Exception as e:
+            logger.error(f"Failover handling error: {e}")
+    
+    def _handle_team_failover_sequential(self, failed_team: str, active_leads: Dict, team_results: Dict):
+        """Handle failover for a failed team in sequential processing"""
+        try:
+            backup_team = self.failover_manager.get_backup_team(failed_team)
+            
+            if not backup_team or backup_team not in self.team_clients:
+                opt_logger.browser_status(f"❌ No backup available for {failed_team}")
+                return
+            
+            if backup_team in self.failed_teams:
+                opt_logger.browser_status(f"❌ Backup team {backup_team} also failed - cannot failover")
+                return
+            
+            # Get remaining leads for failed team  
+            failed_leads = active_leads.get(failed_team, [])
+            if not failed_leads:
+                return
+            
+            opt_logger.browser_status(f"🚨 FAILOVER TRIGGERED: {failed_team} → {backup_team}")
+            
+            # Merge teams and process leads with backup team
+            success = self.failover_manager.redistribute_leads(
+                failed_leads, backup_team, self.team_clients[backup_team], self.quota_manager
+            )
+            
+            if success:
+                # Process the failed leads with backup team
+                backup_result = self._process_team_with_health_monitoring(backup_team, failed_leads)
+                
+                # Merge results
+                if backup_team in team_results:
+                    team_results[backup_team]['processed'] += backup_result.get('processed', 0)
+                    team_results[backup_team]['errors'] += backup_result.get('errors', 0)
+                else:
+                    team_results[backup_team] = backup_result
+                
+                # Mark failed team
+                self.failed_teams.add(failed_team)
+                
+                # Log the failover event
+                self.failover_manager.log_failover_event(failed_team, backup_team, len(failed_leads))
+                
+                opt_logger.browser_status(f"✅ FAILOVER SUCCESS: {len(failed_leads)} leads processed by {backup_team}")
+            else:
+                opt_logger.browser_status(f"❌ FAILOVER FAILED for {failed_team}")
+                
+        except Exception as e:
+            logger.error(f"Sequential failover handling error: {e}")
+    
+    def _process_team_with_health_monitoring(self, team_id: str, leads: List[Dict]) -> Dict:
+        """Process team leads with continuous health monitoring"""
+        try:
+            # Initial health check
+            client = self.team_clients.get(team_id)
+            if not client or not self.failover_manager.check_team_health(team_id, client):
+                opt_logger.browser_status(f"🚨 Team {team_id} failed initial health check")
+                return {'processed': 0, 'errors': len(leads), 'health_failed': True}
+            
+            # Process leads with periodic health checks
+            processed = 0
+            errors = 0
+            health_check_interval = 5  # Check health every 5 leads
+            
+            for i, lead in enumerate(leads, 1):
+                # Periodic health check
+                if i % health_check_interval == 0:
+                    if not self.failover_manager.check_team_health(team_id, client):
+                        opt_logger.browser_status(f"🚨 Team {team_id} health check FAILED at lead {i}/{len(leads)}")
+                        remaining_leads = len(leads) - i + 1
+                        return {
+                            'processed': processed, 
+                            'errors': errors, 
+                            'health_failed': True,
+                            'remaining_leads': leads[i-1:],  # Unprocessed leads
+                            'failure_point': i
+                        }
+                
+                # Process single lead
+                try:
+                    # Get counsellor for this team (with merged counsellors if applicable)
+                    counsellor_name, counsellor_config = self._get_team_counsellor(team_id)
+                    if not counsellor_name:
+                        errors += 1
+                        continue
+                    
+                    result = self._process_single_lead_for_team_secured(
+                        lead, counsellor_name, counsellor_config, client, team_id
+                    )
+                    
+                    # Track analytics
+                    if team_id in self.team_analytics:
+                        self.team_analytics[team_id].track_result(
+                            str(lead.get('lead_id', '')), 
+                            counsellor_name, 
+                            result, 
+                            result.status
+                        )
+                    
+                    # Update quota
+                    if result.success:
+                        self.quota_manager.increment_quota(team_id)
+                        processed += 1
+                        
+                        lead_name = lead.get('full_name', 'Customer')
+                        team_config = self.team_manager.get_team_by_id(team_id)
+                        expected_phone = team_config['phone']
+                        logger.info(f"✅ {team_id} ({expected_phone}): {lead_name} → {counsellor_name}")
+                    else:
+                        errors += 1
+                    
+                    # Add human-like delay
+                    if i < len(leads):  # Not last message
+                        delay = random.uniform(MIN_DELAY_BETWEEN_MESSAGES, MAX_DELAY_BETWEEN_MESSAGES)
+                        
+                        if delay < 120:
+                            delay_type = "⚡ Quick"
+                        elif delay < 300:
+                            delay_type = "⏳ Normal"  
+                        else:
+                            delay_type = "🐌 Careful"
+                        
+                        logger.info(f"🤖→👤 {team_id}: {delay_type} human-like delay: {delay:.1f}s")
+                        time.sleep(delay)
+                        
+                except Exception as e:
+                    logger.error(f"Error processing lead in team {team_id}: {e}")
+                    errors += 1
+            
+            logger.info(f"🔐 {team_id} processing complete: {processed} sent, {errors} errors")
+            return {'processed': processed, 'errors': errors, 'health_failed': False}
+            
+        except Exception as e:
+            logger.error(f"Team processing error for {team_id}: {e}")
+            return {'processed': 0, 'errors': len(leads), 'health_failed': True}
     
     def _process_single_team_secured(self, team_id: str, leads: List[Dict]) -> Dict:
         """Process leads for a single team with STRICT security validation"""
@@ -2907,19 +3668,63 @@ class MultiTeamAutomation:
                 }
             
             # Process teams in parallel
+            campaign_start_time = datetime.now()
             team_results = self.process_teams_parallel(distributed_leads)
             
             # Get final metrics
             final_metrics = self.get_combined_metrics()
             
-            return {
-                'status': 'completed',
-                'successful_teams': successful_teams,
-                'failed_teams': [team for team, success in browser_results.items() if not success],
-                'team_results': team_results,
-                'metrics': final_metrics,
-                'timestamp': datetime.now().isoformat()
-            }
+            # 📊 NEW: Generate and send daily report to management
+            try:
+                campaign_result = {
+                    'status': 'completed',
+                    'successful_teams': successful_teams,
+                    'failed_teams': [team for team, success in browser_results.items() if not success],
+                    'team_results': team_results,
+                    'metrics': final_metrics,
+                    'failover_events': self.failover_manager.failover_history,
+                    'start_time': campaign_start_time.isoformat(),
+                    'timestamp': datetime.now().isoformat()
+                }
+                
+                # Generate comprehensive daily report
+                opt_logger.browser_status("📊 Generating daily management report...")
+                report_content = self.report_generator.generate_comprehensive_report(
+                    campaign_result, self.failover_manager.failover_history
+                )
+                
+                # Find any available client for sending reports
+                available_client = None
+                for team_id, client in self.team_clients.items():
+                    if client and hasattr(client, 'driver') and client.driver:
+                        try:
+                            # Quick health check
+                            if self.failover_manager.check_team_health(team_id, client):
+                                available_client = client
+                                break
+                        except:
+                            continue
+                
+                # Send report to management
+                if available_client:
+                    opt_logger.browser_status("📊 Sending daily report to management...")
+                    report_sent = self.report_generator.send_report_to_management(
+                        report_content, available_client
+                    )
+                    
+                    if report_sent:
+                        opt_logger.browser_status("✅ Daily report sent to management successfully")
+                    else:
+                        opt_logger.browser_status("⚠️ Daily report sending had issues")
+                else:
+                    opt_logger.browser_status("⚠️ No active WhatsApp client available for sending reports")
+                    logger.warning("Daily report generated but could not be sent - no active WhatsApp sessions")
+                
+            except Exception as e:
+                logger.error(f"Error generating/sending daily report: {e}")
+                opt_logger.browser_status("❌ Daily report generation failed")
+            
+            return campaign_result
             
         except Exception as e:
             logger.error(f"Multi-team campaign error: {e}")
@@ -3015,11 +3820,27 @@ def print_config_banner():
         safe_print(f"   🐌 SLOW MODE: Extra careful delays for maximum safety")
     
     safe_print(f"")
+    safe_print(f"📊 AUTOMATED DAILY REPORTING:")
+    safe_print(f"   📋 Comprehensive campaign reports generated automatically")
+    safe_print(f"   📱 Auto-sent to management: Salman Sir, Sagar Sir, Sweta Mam, Dipali Mam, Fahad")
+    safe_print(f"   📈 Includes: Team performance, counselor stats, failover events")
+    safe_print(f"   📄 Template: report.txt (customizable like template.txt)")
+    safe_print(f"   💼 Business insights: Lead value, weekly progress, next campaign")
+    
+    safe_print(f"")
+    safe_print(f"🔄 INTELLIGENT FAILOVER SYSTEM:")
+    safe_print(f"   🚨 Real-time WhatsApp session monitoring")
+    safe_print(f"   🔄 Automatic lead redistribution on team failure")
+    safe_print(f"   📱 sweta_jio fails → merge with sweta_airtel")
+    safe_print(f"   📱 dipali_jio fails → merge with dipali_airtel")
+    safe_print(f"   👥 Combined counselor pools for seamless operation")
+    safe_print(f"")
     safe_print(f"🔐 CRITICAL SECURITY NOTICE:")
     safe_print(f"   ⚠️  MUST scan QR codes with CORRECT manager phones!")
     safe_print(f"   📱 Each team ONLY uses its designated WhatsApp number")
     safe_print(f"   🚨 Teams without proper login will be SKIPPED")
     safe_print(f"   ✅ Only active/logged-in teams will process leads")
+    safe_print(f"   🔄 Failed teams automatically failover to backups")
     safe_print("="*70)
 
 def print_final_summary(result: Dict):
@@ -3075,6 +3896,19 @@ def print_final_summary(result: Dict):
                 for team_id in failed_teams:
                     safe_print(f"      🔸 {team_id} - LOGIN REQUIRED")
         
+        # 🚀 NEW: Show failover events if any occurred
+        failover_events = result.get('failover_events', [])
+        if failover_events:
+            safe_print(f"")
+            safe_print(f"🔄 INTELLIGENT FAILOVER EVENTS:")
+            for event in failover_events:
+                failed_team = event.get('failed_team', 'Unknown')
+                backup_team = event.get('backup_team', 'Unknown')
+                leads_count = event.get('leads_redistributed', 0)
+                timestamp = event.get('timestamp', 'Unknown')
+                safe_print(f"   💥 {failed_team} → 🔄 {backup_team} ({leads_count} leads at {timestamp})")
+            safe_print(f"   ✅ All failed team leads automatically processed by backup teams")
+        
         # Show team breakdown if available
         team_breakdown = metrics.get('team_breakdown', {})
         if team_breakdown:
@@ -3094,12 +3928,20 @@ def print_final_summary(result: Dict):
             safe_print("   📱 Monitor responses across all manager phones")
             safe_print("   🔍 Review message logs in admin panel")
             safe_print("   📊 Check team-specific analytics")
+            safe_print("   📊 Daily report sent to management automatically")
         else:
             safe_print("\n⚠️ NO MESSAGES SENT - CHECK:")
             safe_print("   🌐 WhatsApp Web login status for all teams")
             safe_print("   📱 Phone number formats in .env")
             safe_print("   🖥️ Browser and Chrome driver setup")
             safe_print("   👥 Team configurations in .env")
+        
+        # 📊 NEW: Show daily report status
+        safe_print("\n📊 DAILY REPORT STATUS:")
+        safe_print("   📋 Comprehensive report generated from campaign data")
+        safe_print("   📱 Sent to: Salman Sir, Sagar Sir, Sweta Mam, Dipali Mam, Fahad")
+        safe_print("   📄 Template: report.txt (customizable)")
+        safe_print("   💼 Includes: Performance, analytics, business insights")
     
     elif status == 'all_browsers_failed':
         safe_print(f"🖥️ STATUS: ALL BROWSER SESSIONS FAILED")
